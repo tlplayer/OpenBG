@@ -33,9 +33,10 @@ Check the following:
 - Chimney smoke, butterflies, fish, and blue torches animate where visible.
 - Fountain and smoke BAMs blend over the area without black rectangles.
 - The selected Xvart has a green selection ellipse.
-- ARE actors appear as color-coded humanoid/animal markers. Right-clicking one
-  makes the Xvart approach it and opens its localized CRE/DLG/TLK conversation
-  once in range. Number keys `1`–`9` choose visible replies; `Esc` closes it.
+- ARE actors—including Gorion, Imoen, monks, cows, and seagulls—appear as decoded,
+  animated BAM sprites at their placed positions. Right-clicking one makes the
+  Xvart approach it and opens its localized CRE/DLG/TLK conversation once in
+  range. Number keys `1`–`9` choose visible replies; `Esc` closes it.
 - Keeper of the Portal displays his canonical line beginning “I apologize” and
   an end/continue option rather than generated prototype text.
 - Left-clicking a reachable point routes the Xvart around blocked search-map
@@ -51,7 +52,8 @@ Check the following:
 
 Expected limitations for this increment:
 
-- ARE actors use generated markers rather than decoded creature animations.
+- Unsupported creature animation families fall back to generated markers;
+  equipment overlays and false-color palette replacement are not implemented.
 - Dialogue currently evaluates unconditional, `True()`, and
   `NumTimesTalkedTo` conditions. Replies guarded by other script conditions are
   hidden; dialogue actions and cross-DLG transitions are retained but not yet

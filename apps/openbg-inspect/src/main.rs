@@ -1,7 +1,7 @@
 use std::error::Error;
 use std::path::PathBuf;
 
-use openbg_catalog::{GameInstall, ResourceCatalog};
+use openbg_catalog::GameInstall;
 use openbg_content::{AnimationLoader, AreaLoader, ConversationLoader};
 use openbg_domain::ResRef;
 
@@ -23,8 +23,6 @@ fn main() -> Result<(), Box<dyn Error>> {
         "area" => inspect_area(&install, &resource)?,
         "animation" => inspect_animation(&install, &resource)?,
         "creature" => inspect_creature(&install, &resource)?,
-        "ids" => print!("{}", String::from_utf8(install.read_file(&openbg_domain::ResourceId::new(resource, openbg_domain::ResourceKind::Ids))?)?),
-        "2da" => print!("{}", String::from_utf8(install.read_file(&openbg_domain::ResourceId::new(resource, openbg_domain::ResourceKind::TwoDa))?)?),
         _ => return Err(USAGE.into()),
     }
     Ok(())
@@ -124,4 +122,4 @@ fn inspect_animation(install: &GameInstall, animation: &ResRef) -> Result<(), Bo
     Ok(())
 }
 
-const USAGE: &str = "usage: openbg-inspect <game-directory> area <resref>\n       openbg-inspect <game-directory> animation <resref>\n       openbg-inspect <game-directory> creature <resref>\n       openbg-inspect <game-directory> ids <resref>\n       openbg-inspect <game-directory> 2da <resref>";
+const USAGE: &str = "usage: openbg-inspect <game-directory> area <resref>\n       openbg-inspect <game-directory> animation <resref>\n       openbg-inspect <game-directory> creature <resref>";

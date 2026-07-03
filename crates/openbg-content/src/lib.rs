@@ -72,6 +72,12 @@ pub struct AnimationContent {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatureAnimationContent {
+    pub animation: AnimationContent,
+    pub flip_x: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct CreatureConversation {
     pub creature: ResRef,
     pub display_name: Option<String>,
@@ -268,6 +274,87 @@ impl<'a, C: ResourceCatalog + ?Sized> AnimationLoader<'a, C> {
     }
 }
 
+/// Resolves an ARE/CRE animation ID to its standing/walking BAM body sprite.
+pub struct CreatureAnimationLoader<'a, C: ResourceCatalog + ?Sized> {
+    catalog: &'a C,
+}
+
+impl<'a, C: ResourceCatalog + ?Sized> CreatureAnimationLoader<'a, C> {
+    #[must_use]
+    pub const fn new(catalog: &'a C) -> Self {
+        Self { catalog }
+    }
+
+    /// Loads the general animation for a creature facing its ARE orientation.
+    ///
+    /// Character animation IDs select a direction-specific BAM. Legacy and
+    /// ambient animation families keep their directions in one BAM and are
+    /// mirrored for east-facing orientations.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the animation ID is not mapped or its BAM
+    /// cannot be resolved/decoded.
+    pub fn load(
+        &self,
+        animation_id: u32,
+        orientation: u16,
+    ) -> Result<CreatureAnimationContent, ContentError> {
+        let (id, flip_x) = creature_animation_resref(animation_id, orientation)?;
+        let animation = AnimationLoader::new(self.catalog).load_first_cycle(&id)?;
+        Ok(CreatureAnimationContent { animation, flip_x })
+    }
+}
+
+fn creature_animation_resref(
+    animation_id: u32,
+    orientation: u16,
+) -> Result<(ResRef, bool), ContentError> {
+    let facing = orientation % 16;
+    let flip_x = facing > 8;
+    let name = if (0x5000..=0x6315).contains(&animation_id) {
+        let family = (animation_id >> 8) & 0xf;
+        let race = animation_id & 0xf;
+        let gender = (animation_id >> 4) & 0xf;
+        let race = match race {
+            0 | 5 => 'H',
+            1 => 'E',
+            2 | 4 => 'D',
+            3 => 'I',
+            _ => return unsupported_creature_animation(animation_id),
+        };
+        let gender = match gender {
+            0 => 'M',
+            1 => 'F',
+            _ => return unsupported_creature_animation(animation_id),
+        };
+        let body = match family {
+            0 | 1 | 3 => "B1",
+            2 => "W1",
+            _ => return unsupported_creature_animation(animation_id),
+        };
+        let direction = if facing <= 8 { facing } else { 16 - facing } + 1;
+        format!("C{race}{gender}{body}G1{direction}")
+    } else {
+        match animation_id {
+            0x6402 => "CMNK1G1".to_owned(),
+            0xb000 => "ACOWG1".to_owned(),
+            0xc700 => "NBOYLG1".to_owned(),
+            0xc710 => "NGRLLG1".to_owned(),
+            0xd100 => "AGULG1".to_owned(),
+            _ => return unsupported_creature_animation(animation_id),
+        }
+    };
+    let id = ResRef::new(name).map_err(|error| ContentError::Invalid(error.to_string()))?;
+    Ok((id, flip_x))
+}
+
+fn unsupported_creature_animation<T>(animation_id: u32) -> Result<T, ContentError> {
+    Err(ContentError::Invalid(format!(
+        "unsupported creature animation ID {animation_id:#06x}"
+    )))
+}
+
 fn animation_content(id: &ResRef, bam: &Bam, cycle: &openbg_formats::BamCycle) -> AnimationContent {
     let frames = cycle
         .frame_indices
@@ -443,7 +530,7 @@ mod tests {
     use openbg_domain::{ResRef, ResourceId};
     use openbg_formats::OwnedResourceData;
 
-    use super::{AreaLoader, ContentError};
+    use super::{creature_animation_resref, AreaLoader, ContentError};
 
     struct EmptyCatalog;
 
@@ -467,5 +554,34 @@ mod tests {
             error,
             ContentError::Catalog(CatalogError::NotFound(_))
         ));
+    }
+
+    #[test]
+    fn resolves_character_animation_direction_and_mirroring() {
+        let (south, south_flip) = creature_animation_resref(0x6200, 0).expect("Gorion");
+        assert_eq!(south.as_str(), "CHMW1G11");
+        assert!(!south_flip);
+
+        let (east, east_flip) = creature_animation_resref(0x6210, 12).expect("Phlydia");
+        assert_eq!(east.as_str(), "CHFW1G15");
+        assert!(east_flip);
+    }
+
+    #[test]
+    fn resolves_candlekeep_special_animation_families() {
+        assert_eq!(
+            creature_animation_resref(0xc710, 0)
+                .expect("girl")
+                .0
+                .as_str(),
+            "NGRLLG1"
+        );
+        assert_eq!(
+            creature_animation_resref(0xb000, 14)
+                .expect("cow")
+                .0
+                .as_str(),
+            "ACOWG1"
+        );
     }
 }

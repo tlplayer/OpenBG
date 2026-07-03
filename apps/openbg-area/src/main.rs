@@ -12,8 +12,8 @@ use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use openbg_catalog::GameInstall;
 use openbg_content::{
     AnimationContent, AnimationLoader, AreaAnimationPlacement, AreaContent, AreaLoader,
-    ConversationLoader, CreatureConversation, DialogueStateContent, DialogueTransitionContent,
-    ImageData,
+    ConversationLoader, CreatureAnimationContent, CreatureAnimationLoader, CreatureConversation,
+    DialogueStateContent, DialogueTransitionContent, ImageData,
 };
 use openbg_domain::{GridPoint, ResRef};
 use openbg_sim::find_path;
@@ -45,6 +45,22 @@ fn main() -> Result<(), Box<dyn Error>> {
             Err(error) => eprintln!("warning: could not load creature {creature}: {error}"),
         }
     }
+    let creature_animation_loader = CreatureAnimationLoader::new(&install);
+    let creature_animations = content
+        .actors
+        .iter()
+        .map(|actor| {
+            creature_animation_loader
+                .load(actor.animation_id, actor.orientation)
+                .map_err(|error| {
+                    eprintln!(
+                        "warning: could not load sprite for {} ({:#06x}): {error}",
+                        actor.name, actor.animation_id
+                    );
+                })
+                .ok()
+        })
+        .collect::<Vec<_>>();
     let area_animations = content
         .animations
         .iter()
@@ -97,6 +113,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             content,
             xvart,
             area_animations,
+            creature_animations,
             conversations,
         })
         .insert_resource(ConversationState::default())
@@ -136,6 +153,7 @@ struct LoadedArea {
     content: AreaContent,
     xvart: Option<AnimationContent>,
     area_animations: Vec<LoadedAreaAnimation>,
+    creature_animations: Vec<Option<CreatureAnimationContent>>,
     conversations: BTreeMap<ResRef, CreatureConversation>,
 }
 
@@ -285,7 +303,7 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
         rgba: make_npc_pixels(),
     };
     let npc_image = images.add(bevy_image(&npc_data));
-    for actor in &area.content.actors {
+    for (actor, animation) in area.content.actors.iter().zip(&area.creature_animations) {
         let conversation = actor
             .creature
             .as_ref()
@@ -298,17 +316,56 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
             area.content.base.width,
             area.content.base.height,
         );
-        let mut sprite = Sprite::from_image(npc_image.clone());
-        sprite.color = npc_color(display_name);
-        commands.spawn((
+        let loaded_frames = animation.as_ref().map(|loaded| {
+            loaded
+                .animation
+                .frames
+                .iter()
+                .map(|frame| images.add(bevy_image(&frame.image)))
+                .collect::<Vec<_>>()
+        });
+        let (sprite, transform, frame_animation) = loaded_frames
+            .filter(|frames| !frames.is_empty())
+            .map(|frames| {
+                let loaded = animation.as_ref().expect("frames came from this animation");
+                let offsets = loaded
+                    .animation
+                    .frames
+                    .iter()
+                    .map(animation_frame_offset)
+                    .collect::<Vec<_>>();
+                let mut sprite = Sprite::from_image(frames[0].clone());
+                sprite.flip_x = loaded.flip_x;
+                let transform = Transform::from_translation((position + offsets[0]).extend(8.0));
+                let frame_animation = (frames.len() > 1).then(|| FrameAnimation {
+                    frames,
+                    offsets,
+                    current: 0,
+                    timer: Timer::from_seconds(0.10, TimerMode::Repeating),
+                });
+                (sprite, transform, frame_animation)
+            })
+            .unwrap_or_else(|| {
+                let mut sprite = Sprite::from_image(npc_image.clone());
+                sprite.color = npc_color(display_name);
+                (
+                    sprite,
+                    Transform::from_translation(position.extend(8.0)),
+                    None,
+                )
+            });
+        let mut entity = commands.spawn((
             sprite,
-            Transform::from_translation(position.extend(8.0)),
+            transform,
             Npc {
                 name: display_name.to_owned(),
                 creature: actor.creature.clone(),
             },
             Name::new(format!("NPC: {display_name}")),
         ));
+        if let Some(frame_animation) = frame_animation {
+            entity.insert(frame_animation);
+        }
     }
 
     for region in &area.content.regions {

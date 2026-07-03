@@ -105,6 +105,7 @@ pub enum ResourceKind {
     Itm,
     Key,
     Mos,
+    Pvrz,
     Spl,
     Tis,
     Tlk,

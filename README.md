@@ -12,6 +12,22 @@ not ship copyrighted game data.
 > Status: architecture and format-spike stage. The Rust files currently in
 > `engine/` are prototypes; the workspace described below is the target layout.
 
+## Area viewer
+
+The first vertical slice loads an Enhanced Edition area through KEY/BIFF,
+decodes its WED and palette/PVRZ-backed TIS resources, and displays the composed
+base layer in a Bevy window:
+
+```bash
+cargo run -p openbg-area -- \
+  "/path/to/Baldur's Gate Enhanced Edition" AR2600
+```
+
+`AR2600` is the default area when the second argument is omitted. Pan with WASD
+or the arrow keys and zoom with the mouse wheel. The viewer currently renders
+only the static base layer; overlays, animated tiles, doors, walls, actors,
+lighting, and fog belong to later slices.
+
 ## Goals
 
 - Preserve Infinity Engine behavior where it affects saves, combat, movement,

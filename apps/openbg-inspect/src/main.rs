@@ -30,11 +30,15 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn inspect_area(install: &GameInstall, area: &ResRef) -> Result<(), Box<dyn Error>> {
     let content = AreaLoader::new(install).load(area)?;
     println!(
-        "area {}: {}x{} RGBA, {} actors",
+        "area {}: {}x{} RGBA, {}x{} navigation, {} actors, {} regions, {} animations",
         content.id,
         content.base.width,
         content.base.height,
-        content.actors.len()
+        content.navigation.width(),
+        content.navigation.height(),
+        content.actors.len(),
+        content.regions.len(),
+        content.animations.len()
     );
     for actor in &content.actors {
         let creature = actor.creature.as_ref().map_or("<embedded>", ResRef::as_str);
@@ -46,6 +50,26 @@ fn inspect_area(install: &GameInstall, area: &ResRef) -> Result<(), Box<dyn Erro
             actor.orientation,
             actor.animation_id,
             creature
+        );
+    }
+    for region in &content.regions {
+        println!(
+            "  region {:<24} kind={} bounds={:?} destination={}",
+            region.name,
+            region.kind,
+            region.bounds,
+            region.destination_area.as_ref().map_or("-", ResRef::as_str)
+        );
+    }
+    for animation in &content.animations {
+        println!(
+            "  animation {:<21} at ({:>5}, {:>5}) bam={} cycle={} flags={:#x}",
+            animation.name,
+            animation.position[0],
+            animation.position[1],
+            animation.animation,
+            animation.sequence,
+            animation.flags
         );
     }
     Ok(())

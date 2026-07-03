@@ -98,6 +98,7 @@ impl KeyIndex {
 
 fn kind_from_code(code: u16) -> ResourceKind {
     match code {
+        0x0001 => ResourceKind::Bmp,
         0x03e8 => ResourceKind::Bam,
         0x03e9 => ResourceKind::Wed,
         0x03eb => ResourceKind::Tis,

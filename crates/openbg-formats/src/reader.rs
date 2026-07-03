@@ -33,6 +33,10 @@ impl<'a> Reader<'a> {
         Ok(i16::from_le_bytes(self.array(offset)?))
     }
 
+    pub(crate) fn i32(&self, offset: usize) -> Result<i32, FormatError> {
+        Ok(i32::from_le_bytes(self.array(offset)?))
+    }
+
     pub(crate) fn u32(&self, offset: usize) -> Result<u32, FormatError> {
         Ok(u32::from_le_bytes(self.array(offset)?))
     }

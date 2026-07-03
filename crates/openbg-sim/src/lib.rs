@@ -4,11 +4,15 @@
 //! command ordering, seeded randomness, stable IDs, ticks, events, and state
 //! checksums concrete before game-specific rules are added.
 
+mod navigation;
+
 use std::collections::BTreeMap;
 use std::error::Error;
 use std::fmt;
 
 use openbg_domain::{EntityId, GameTick, TickOverflow};
+
+pub use navigation::{find_path, PathError};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GameCommand {

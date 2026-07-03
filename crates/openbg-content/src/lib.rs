@@ -4,9 +4,10 @@ use std::error::Error;
 use std::fmt;
 
 use openbg_catalog::{CatalogError, ResourceCatalog};
-use openbg_domain::{ResRef, ResourceId, ResourceKind};
+use openbg_domain::{NavigationGrid, ResRef, ResourceId, ResourceKind};
 use openbg_formats::{
-    compose_base_layer, compose_base_layer_with_pages, Are, Bam, FormatError, ResourceData, Wed,
+    compose_base_layer, compose_base_layer_with_pages, Are, Bam, FormatError, IndexedBitmap,
+    ResourceData, Wed,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -20,7 +21,10 @@ pub struct ImageData {
 pub struct AreaContent {
     pub id: ResRef,
     pub base: ImageData,
+    pub navigation: NavigationGrid,
     pub actors: Vec<ActorPlacement>,
+    pub regions: Vec<RegionPlacement>,
+    pub animations: Vec<AreaAnimationPlacement>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -30,6 +34,29 @@ pub struct ActorPlacement {
     pub orientation: u16,
     pub animation_id: u32,
     pub creature: Option<ResRef>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RegionPlacement {
+    pub name: String,
+    pub kind: u16,
+    pub bounds: [u16; 4],
+    pub destination_area: Option<ResRef>,
+    pub destination_entrance: String,
+    pub flags: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AreaAnimationPlacement {
+    pub name: String,
+    pub position: [u16; 2],
+    pub schedule: u32,
+    pub animation: ResRef,
+    pub sequence: u16,
+    pub frame: u16,
+    pub flags: u32,
+    pub height: u16,
+    pub transparency: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -63,6 +90,18 @@ impl<'a, C: ResourceCatalog + ?Sized> AreaLoader<'a, C> {
     pub fn load(&self, area: &ResRef) -> Result<AreaContent, ContentError> {
         let are_id = ResourceId::new(area.clone(), ResourceKind::Are);
         let are = Are::parse(&self.catalog.read_file(&are_id)?)?;
+        let search_name = ResRef::new(format!("{}SR", area.as_str()))
+            .map_err(|error| ContentError::Invalid(error.to_string()))?;
+        let search_id = ResourceId::new(search_name, ResourceKind::Bmp);
+        let search = IndexedBitmap::parse(&self.catalog.read_file(&search_id)?)?;
+        let navigation = NavigationGrid::new(
+            u16::try_from(search.width)
+                .map_err(|_| ContentError::Invalid("search-map width exceeds u16".into()))?,
+            u16::try_from(search.height)
+                .map_err(|_| ContentError::Invalid("search-map height exceeds u16".into()))?,
+            search.pixels,
+        )
+        .map_err(|error| ContentError::Invalid(error.to_string()))?;
         let wed_id = ResourceId::new(area.clone(), ResourceKind::Wed);
         let wed_bytes = self.catalog.read_file(&wed_id)?;
         let wed = Wed::parse(&wed_bytes)?;
@@ -100,6 +139,7 @@ impl<'a, C: ResourceCatalog + ?Sized> AreaLoader<'a, C> {
                 height: image.height,
                 rgba: image.pixels,
             },
+            navigation,
             actors: are
                 .actors
                 .into_iter()
@@ -109,6 +149,33 @@ impl<'a, C: ResourceCatalog + ?Sized> AreaLoader<'a, C> {
                     orientation: actor.orientation,
                     animation_id: actor.animation_id,
                     creature: actor.creature,
+                })
+                .collect(),
+            regions: are
+                .regions
+                .into_iter()
+                .map(|region| RegionPlacement {
+                    name: region.name,
+                    kind: region.kind,
+                    bounds: region.bounds,
+                    destination_area: region.destination_area,
+                    destination_entrance: region.destination_entrance,
+                    flags: region.flags,
+                })
+                .collect(),
+            animations: are
+                .animations
+                .into_iter()
+                .map(|animation| AreaAnimationPlacement {
+                    name: animation.name,
+                    position: animation.position,
+                    schedule: animation.schedule,
+                    animation: animation.animation,
+                    sequence: animation.sequence,
+                    frame: animation.frame,
+                    flags: animation.flags,
+                    height: animation.height,
+                    transparency: animation.transparency,
                 })
                 .collect(),
         })
@@ -141,25 +208,55 @@ impl<'a, C: ResourceCatalog + ?Sized> AnimationLoader<'a, C> {
             .iter()
             .find(|cycle| !cycle.frame_indices.is_empty())
             .ok_or_else(|| ContentError::Invalid(format!("BAM {id} has no animation frames")))?;
-        let frames = cycle
-            .frame_indices
-            .iter()
-            .map(|index| {
-                let frame = &bam.frames[usize::from(*index)];
-                AnimationFrame {
-                    image: ImageData {
-                        width: u32::from(frame.width),
-                        height: u32::from(frame.height),
-                        rgba: frame.rgba.clone(),
-                    },
-                    center: [frame.center_x, frame.center_y],
-                }
-            })
-            .collect();
-        Ok(AnimationContent {
-            id: id.clone(),
-            frames,
+        Ok(animation_content(id, &bam, cycle))
+    }
+
+    /// Loads one animation cycle from a BAM resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the BAM cannot be decoded or the requested
+    /// cycle is absent or empty.
+    pub fn load_cycle(
+        &self,
+        id: &ResRef,
+        cycle_index: u16,
+    ) -> Result<AnimationContent, ContentError> {
+        let resource_id = ResourceId::new(id.clone(), ResourceKind::Bam);
+        let bytes = self.catalog.read_file(&resource_id)?;
+        let bam = Bam::parse(&bytes)?;
+        let cycle = bam
+            .cycles
+            .get(usize::from(cycle_index))
+            .ok_or_else(|| ContentError::Invalid(format!("BAM {id} has no cycle {cycle_index}")))?;
+        if cycle.frame_indices.is_empty() {
+            return Err(ContentError::Invalid(format!(
+                "BAM {id} cycle {cycle_index} has no animation frames"
+            )));
+        }
+        Ok(animation_content(id, &bam, cycle))
+    }
+}
+
+fn animation_content(id: &ResRef, bam: &Bam, cycle: &openbg_formats::BamCycle) -> AnimationContent {
+    let frames = cycle
+        .frame_indices
+        .iter()
+        .map(|index| {
+            let frame = &bam.frames[usize::from(*index)];
+            AnimationFrame {
+                image: ImageData {
+                    width: u32::from(frame.width),
+                    height: u32::from(frame.height),
+                    rgba: frame.rgba.clone(),
+                },
+                center: [frame.center_x, frame.center_y],
+            }
         })
+        .collect();
+    AnimationContent {
+        id: id.clone(),
+        frames,
     }
 }
 

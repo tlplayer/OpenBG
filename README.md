@@ -24,11 +24,17 @@ cargo run -p openbg-area -- \
 ```
 
 `AR2600` is the default area when the second argument is omitted. Pan with WASD
-or the arrow keys, zoom with the mouse wheel, and left-click to move the Xvart.
-When it has no player order, the Xvart walks a small AI patrol. The viewer
-currently renders only the static base layer and a generated actor marker;
-search-map pathfinding, BAM animation, overlays, doors, walls, lighting, and fog
-belong to later slices.
+or the arrow keys, zoom with the mouse wheel, and left-click to move the selected
+Xvart. Movement follows the area's search map with deterministic pathfinding;
+the Xvart resumes a small patrol when it has no player order. The viewer renders
+ARE actors and looping background BAMs (including Candlekeep's fountains), and
+reveals persistent fog as the party explores. Press `F` to toggle fog and `R` to
+show parsed info/travel-region bounds. Right-click an NPC to approach and begin
+a prototype conversation; press `Esc` to close it.
+
+This is an intentionally small M2/M3 slice. WED overlay animation, real creature
+sprites, canonical CRE/DLG/TLK dialogue, doors, walls/occlusion, area
+transitions, formations, and replayable save/load state remain to be implemented.
 
 ## Goals
 

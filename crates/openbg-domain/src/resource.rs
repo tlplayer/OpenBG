@@ -96,6 +96,7 @@ pub enum ResourceKind {
     TwoDa,
     Are,
     Bam,
+    Bmp,
     Bcs,
     Bif,
     Cre,

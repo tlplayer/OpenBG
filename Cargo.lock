@@ -3032,6 +3032,24 @@ name = "openbg-area"
 version = "0.1.0"
 dependencies = [
  "bevy",
+ "openbg-catalog",
+ "openbg-content",
+ "openbg-domain",
+]
+
+[[package]]
+name = "openbg-catalog"
+version = "0.1.0"
+dependencies = [
+ "openbg-domain",
+ "openbg-formats",
+]
+
+[[package]]
+name = "openbg-content"
+version = "0.1.0"
+dependencies = [
+ "openbg-catalog",
  "openbg-domain",
  "openbg-formats",
 ]
@@ -3045,6 +3063,15 @@ name = "openbg-formats"
 version = "0.1.0"
 dependencies = [
  "flate2",
+ "openbg-domain",
+]
+
+[[package]]
+name = "openbg-inspect"
+version = "0.1.0"
+dependencies = [
+ "openbg-catalog",
+ "openbg-content",
  "openbg-domain",
 ]
 

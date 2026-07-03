@@ -1,6 +1,9 @@
 [workspace]
 members = [
     "apps/openbg-area",
+    "apps/openbg-inspect",
+    "crates/openbg-catalog",
+    "crates/openbg-content",
     "crates/openbg-domain",
     "crates/openbg-formats",
     "crates/openbg-sim",

@@ -1,18 +1,15 @@
 use std::error::Error;
 use std::fmt;
-use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use bevy::asset::RenderAssetUsages;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
-use openbg_domain::{ResRef, ResourceId, ResourceKind};
-use openbg_formats::{
-    compose_base_layer, compose_base_layer_with_pages, BifReader, FormatError, KeyIndex,
-    OwnedResourceData, ResourceData, RgbaImage, Wed,
-};
+use openbg_catalog::GameInstall;
+use openbg_content::{AnimationContent, AnimationLoader, AreaContent, AreaLoader, ImageData};
+use openbg_domain::ResRef;
 
 const DEFAULT_AREA: &str = "AR2600";
 const XVART_SPEED: f32 = 180.0;
@@ -20,17 +17,34 @@ const ARRIVAL_DISTANCE: f32 = 2.0;
 
 fn main() -> Result<(), Box<dyn Error>> {
     let (game_root, area) = arguments()?;
-    let image = load_area(&game_root, &area)?;
+    let install = GameInstall::open(&game_root)?;
+    let content = AreaLoader::new(&install).load(&area)?;
+    let xvart_id = ResRef::new("MXVTG1")?;
+    let xvart = match AnimationLoader::new(&install).load_first_cycle(&xvart_id) {
+        Ok(animation) => {
+            println!(
+                "loaded {} BAM animation: {} frames",
+                animation.id,
+                animation.frames.len()
+            );
+            Some(animation)
+        }
+        Err(error) => {
+            eprintln!("warning: {error}; using generated Xvart marker");
+            None
+        }
+    };
     println!(
-        "loaded {area}: {}x{} pixels from {}",
-        image.width,
-        image.height,
+        "loaded {area}: {}x{} pixels, {} ARE actors from {}",
+        content.base.width,
+        content.base.height,
+        content.actors.len(),
         game_root.display()
     );
 
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.025, 0.025, 0.035)))
-        .insert_resource(LoadedArea { image, area })
+        .insert_resource(LoadedArea { content, xvart })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "OpenBG Area Viewer".into(),
@@ -48,6 +62,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 click_to_move,
                 choose_wander_target,
                 move_xvart,
+                animate_sprites,
             )
                 .chain(),
         )
@@ -57,8 +72,8 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[derive(Resource)]
 struct LoadedArea {
-    image: RgbaImage,
-    area: ResRef,
+    content: AreaContent,
+    xvart: Option<AnimationContent>,
 }
 
 #[derive(Component)]
@@ -88,41 +103,57 @@ struct WanderRoute {
     next: usize,
 }
 
+#[derive(Component)]
+struct FrameAnimation {
+    frames: Vec<Handle<Image>>,
+    current: usize,
+    timer: Timer,
+}
+
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
 fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<LoadedArea>) {
-    let texture = Image::new(
-        Extent3d {
-            width: area.image.width,
-            height: area.image.height,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        area.image.pixels.clone(),
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    let handle = images.add(texture);
+    let handle = images.add(bevy_image(&area.content.base));
     commands.spawn((
         Sprite::from_image(handle),
         Transform::from_xyz(0.0, 0.0, 0.0),
-        Name::new(area.area.to_string()),
+        Name::new(area.content.id.to_string()),
     ));
     commands.spawn((Camera2d, AreaCamera, Name::new("Area camera")));
 
-    let xvart_texture = Image::new(
-        Extent3d {
-            width: 64,
-            height: 64,
-            depth_or_array_layers: 1,
-        },
-        TextureDimension::D2,
-        make_xvart_pixels(),
-        TextureFormat::Rgba8UnormSrgb,
-        RenderAssetUsages::RENDER_WORLD,
-    );
-    commands.spawn((
-        Sprite::from_image(images.add(xvart_texture)),
-        Transform::from_xyz(-300.0, -180.0, 10.0).with_scale(Vec3::splat(1.5)),
+    for actor in &area.content.actors {
+        let position = area_to_world(
+            actor.position,
+            area.content.base.width,
+            area.content.base.height,
+        );
+        commands.spawn((
+            Sprite::from_color(Color::srgba(1.0, 0.72, 0.15, 0.72), Vec2::new(10.0, 16.0)),
+            Transform::from_translation(position.extend(4.0)),
+            Name::new(format!("ARE actor: {}", actor.name)),
+        ));
+    }
+
+    let animation_handles = area.xvart.as_ref().map(|animation| {
+        animation
+            .frames
+            .iter()
+            .map(|frame| images.add(bevy_image(&frame.image)))
+            .collect::<Vec<_>>()
+    });
+    let (xvart_handle, scale) = animation_handles
+        .as_ref()
+        .and_then(|frames| frames.first().cloned().map(|frame| (frame, 1.0)))
+        .unwrap_or_else(|| {
+            let fallback = ImageData {
+                width: 64,
+                height: 64,
+                rgba: make_xvart_pixels(),
+            };
+            (images.add(bevy_image(&fallback)), 1.5)
+        });
+    let mut xvart = commands.spawn((
+        Sprite::from_image(xvart_handle),
+        Transform::from_xyz(-300.0, -180.0, 10.0).with_scale(Vec3::splat(scale)),
         Xvart,
         MovementIntent {
             target: None,
@@ -139,6 +170,46 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
         },
         Name::new("Xvart"),
     ));
+    if let Some(frames) = animation_handles.filter(|frames| frames.len() > 1) {
+        xvart.insert(FrameAnimation {
+            frames,
+            current: 0,
+            timer: Timer::from_seconds(0.12, TimerMode::Repeating),
+        });
+    }
+}
+
+fn bevy_image(image: &ImageData) -> Image {
+    Image::new(
+        Extent3d {
+            width: image.width,
+            height: image.height,
+            depth_or_array_layers: 1,
+        },
+        TextureDimension::D2,
+        image.rgba.clone(),
+        TextureFormat::Rgba8UnormSrgb,
+        RenderAssetUsages::RENDER_WORLD,
+    )
+}
+
+#[allow(clippy::cast_precision_loss)] // Infinity coordinates and images are bounded to u16 scale.
+fn area_to_world(position: [u16; 2], width: u32, height: u32) -> Vec2 {
+    Vec2::new(
+        f32::from(position[0]) - width as f32 * 0.5,
+        height as f32 * 0.5 - f32::from(position[1]),
+    )
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn animate_sprites(time: Res<Time>, mut animations: Query<(&mut Sprite, &mut FrameAnimation)>) {
+    for (mut sprite, mut animation) in &mut animations {
+        animation.timer.tick(time.delta());
+        if animation.timer.just_finished() {
+            animation.current = (animation.current + 1) % animation.frames.len();
+            sprite.image = animation.frames[animation.current].clone();
+        }
+    }
 }
 
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
@@ -162,8 +233,8 @@ fn click_to_move(
     let Ok(world) = camera.viewport_to_world_2d(camera_transform, cursor) else {
         return;
     };
-    let half_width = area.image.width as f32 * 0.5;
-    let half_height = area.image.height as f32 * 0.5;
+    let half_width = area.content.base.width as f32 * 0.5;
+    let half_height = area.content.base.height as f32 * 0.5;
     let target = Vec2::new(
         world.x.clamp(-half_width, half_width),
         world.y.clamp(-half_height, half_height),
@@ -324,97 +395,9 @@ fn arguments() -> Result<(PathBuf, ResRef), ViewerError> {
     Ok((game_root, area))
 }
 
-fn load_area(game_root: &Path, area: &ResRef) -> Result<RgbaImage, ViewerError> {
-    let key_bytes = read(game_root.join("chitin.key"))?;
-    let key = KeyIndex::parse(&key_bytes).map_err(|error| ViewerError::Data(error.to_string()))?;
-    let wed_id = ResourceId::new(area.clone(), ResourceKind::Wed);
-    let wed_bytes = load_file(game_root, &key, &wed_id)?;
-    let wed = Wed::parse(&wed_bytes).map_err(|error| ViewerError::Data(error.to_string()))?;
-    println!(
-        "base overlay: {}x{} tiles, tileset {}",
-        wed.base.width, wed.base.height, wed.base.tileset
-    );
-    let tis_id = ResourceId::new(wed.base.tileset.clone(), ResourceKind::Tis);
-    let tis = load_resource(game_root, &key, &tis_id)?;
-    match tis.as_resource_data() {
-        ResourceData::Tileset {
-            tile_size: 5120, ..
-        } => compose_base_layer(&wed, tis.as_resource_data()),
-        ResourceData::Tileset { tile_size: 12, .. } => {
-            compose_base_layer_with_pages(&wed, tis.as_resource_data(), |page| {
-                let id = ResourceId::new(page.clone(), ResourceKind::Pvrz);
-                load_file(game_root, &key, &id)
-                    .map_err(|error| FormatError::new("PVRZ catalog", error.to_string()))
-            })
-        }
-        ResourceData::Tileset { tile_size, .. } => Err(FormatError::new(
-            "TIS V1",
-            format!("unsupported tile block size {tile_size}"),
-        )),
-        ResourceData::File(_) => Err(FormatError::new("TIS V1", "resource is not a tileset")),
-    }
-    .map_err(|error| ViewerError::Data(error.to_string()))
-}
-
-fn load_file(game_root: &Path, key: &KeyIndex, id: &ResourceId) -> Result<Vec<u8>, ViewerError> {
-    match load_resource(game_root, key, id)?.data {
-        OwnedResourceData::File(bytes) => Ok(bytes),
-        OwnedResourceData::Tileset { .. } => Err(ViewerError::Data(format!("{id:?} is a tileset"))),
-    }
-}
-
-fn load_resource(
-    game_root: &Path,
-    key: &KeyIndex,
-    id: &ResourceId,
-) -> Result<OwnedResource, ViewerError> {
-    let record = key
-        .find(id)
-        .ok_or_else(|| ViewerError::Data(format!("resource not found: {id:?}")))?;
-    let bif_record = key.bifs.get(record.bif_index()).ok_or_else(|| {
-        ViewerError::Data(format!(
-            "resource references missing BIF {}",
-            record.bif_index()
-        ))
-    })?;
-    let bif_path = game_root.join(&bif_record.path);
-    let file = fs::File::open(&bif_path).map_err(|source| ViewerError::Io {
-        path: bif_path.clone(),
-        source,
-    })?;
-    let mut archive = BifReader::new(file)
-        .map_err(|error| ViewerError::Data(format!("{}: {error}", bif_path.display())))?;
-    let data = archive
-        .resource(record.locator, id.kind == ResourceKind::Tis)
-        .map_err(|error| ViewerError::Data(format!("{id:?}: {error}")))?;
-    Ok(OwnedResource { data })
-}
-
-struct OwnedResource {
-    data: OwnedResourceData,
-}
-
-impl OwnedResource {
-    fn as_resource_data(&self) -> ResourceData<'_> {
-        self.data.as_borrowed()
-    }
-}
-
-fn read(path: impl AsRef<Path>) -> Result<Vec<u8>, ViewerError> {
-    let path = path.as_ref();
-    fs::read(path).map_err(|source| ViewerError::Io {
-        path: path.to_owned(),
-        source,
-    })
-}
-
 #[derive(Debug)]
 enum ViewerError {
     Usage,
-    Io {
-        path: PathBuf,
-        source: std::io::Error,
-    },
     Data(String),
 }
 
@@ -424,7 +407,6 @@ impl fmt::Display for ViewerError {
             Self::Usage => formatter.write_str(
                 "usage: openbg-area <game-directory> [area-resref]\n       or set OPENBG_GAME",
             ),
-            Self::Io { path, source } => write!(formatter, "{}: {source}", path.display()),
             Self::Data(message) => formatter.write_str(message),
         }
     }
@@ -433,7 +415,6 @@ impl fmt::Display for ViewerError {
 impl Error for ViewerError {
     fn source(&self) -> Option<&(dyn Error + 'static)> {
         match self {
-            Self::Io { source, .. } => Some(source),
             Self::Usage | Self::Data(_) => None,
         }
     }

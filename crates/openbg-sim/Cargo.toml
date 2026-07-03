@@ -1,0 +1,12 @@
+[package]
+name = "openbg-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+openbg-domain = { path = "../openbg-domain" }
+
+[lints]
+workspace = true
+

@@ -6,8 +6,8 @@ use std::fmt;
 use openbg_catalog::{CatalogError, ResourceCatalog};
 use openbg_domain::{NavigationGrid, ResRef, ResourceId, ResourceKind};
 use openbg_formats::{
-    compose_base_layer, compose_base_layer_with_pages, Are, Bam, FormatError, IndexedBitmap,
-    ResourceData, Wed,
+    compose_base_layer, compose_base_layer_with_pages, Are, Bam, Cre, Dlg, FormatError,
+    IndexedBitmap, ResourceData, Tlk, Wed,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +69,36 @@ pub struct AnimationFrame {
 pub struct AnimationContent {
     pub id: ResRef,
     pub frames: Vec<AnimationFrame>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatureConversation {
+    pub creature: ResRef,
+    pub display_name: Option<String>,
+    pub dialogue: Option<DialogueContent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DialogueContent {
+    pub id: ResRef,
+    pub states: Vec<DialogueStateContent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DialogueStateContent {
+    pub text: String,
+    pub trigger: Option<String>,
+    pub transitions: Vec<DialogueTransitionContent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DialogueTransitionContent {
+    pub text: Option<String>,
+    pub trigger: Option<String>,
+    pub action: Option<String>,
+    pub terminates: bool,
+    pub next_dialogue: Option<ResRef>,
+    pub next_state: Option<u32>,
 }
 
 /// Builds canonical area content without depending on Bevy or filesystem I/O.
@@ -257,6 +287,114 @@ fn animation_content(id: &ResRef, bam: &Bam, cycle: &openbg_formats::BamCycle) -
     AnimationContent {
         id: id.clone(),
         frames,
+    }
+}
+
+/// Resolves CRE/DLG string references through the installation's `dialog.tlk`.
+pub struct ConversationLoader<'a, C: ResourceCatalog + ?Sized> {
+    catalog: &'a C,
+    strings: Tlk,
+}
+
+impl<'a, C: ResourceCatalog + ?Sized> ConversationLoader<'a, C> {
+    /// Loads `dialog.tlk` once for subsequent creature/dialogue resolution.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the string table is missing or malformed.
+    pub fn new(catalog: &'a C) -> Result<Self, ContentError> {
+        let id = ResourceId::new(
+            ResRef::new("DIALOG").expect("DIALOG is a valid fixed resref"),
+            ResourceKind::Tlk,
+        );
+        let strings = Tlk::parse(&catalog.read_file(&id)?)?;
+        Ok(Self { catalog, strings })
+    }
+
+    /// Loads a creature's display name and complete dialogue state table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the CRE/DLG cannot be resolved or decoded,
+    /// or when a referenced TLK string is outside the string table.
+    pub fn load_creature(&self, id: &ResRef) -> Result<CreatureConversation, ContentError> {
+        let resource = ResourceId::new(id.clone(), ResourceKind::Cre);
+        let creature = Cre::parse(&self.catalog.read_file(&resource)?)?;
+        let display_name = self
+            .optional_text(creature.long_name)?
+            .or(self.optional_text(creature.short_name)?);
+        let dialogue = creature
+            .dialogue
+            .as_ref()
+            .map(|dialogue| self.load_dialogue(dialogue))
+            .transpose()?;
+        Ok(CreatureConversation {
+            creature: id.clone(),
+            display_name,
+            dialogue,
+        })
+    }
+
+    /// Loads and localizes one DLG state table.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] for missing/malformed DLG data or invalid TLK
+    /// references.
+    pub fn load_dialogue(&self, id: &ResRef) -> Result<DialogueContent, ContentError> {
+        let resource = ResourceId::new(id.clone(), ResourceKind::Dlg);
+        let dialogue = Dlg::parse(&self.catalog.read_file(&resource)?)?;
+        let mut states = Vec::with_capacity(dialogue.states.len());
+        for state in &dialogue.states {
+            let start = usize::try_from(state.first_transition)
+                .map_err(|_| ContentError::Invalid("DLG transition index exceeds usize".into()))?;
+            let count = usize::try_from(state.transition_count)
+                .map_err(|_| ContentError::Invalid("DLG transition count exceeds usize".into()))?;
+            let state_transitions = dialogue
+                .transitions
+                .get(start..start + count)
+                .ok_or_else(|| ContentError::Invalid("DLG transition range is missing".into()))?;
+            let transitions = state_transitions
+                .iter()
+                .map(|transition| {
+                    Ok(DialogueTransitionContent {
+                        text: transition
+                            .text
+                            .map(|strref| self.required_text(strref))
+                            .transpose()?,
+                        trigger: transition.trigger.clone(),
+                        action: transition.action.clone(),
+                        terminates: transition.flags & (1 << 3) != 0,
+                        next_dialogue: transition.next_dialogue.clone(),
+                        next_state: transition.next_state,
+                    })
+                })
+                .collect::<Result<Vec<_>, ContentError>>()?;
+            states.push(DialogueStateContent {
+                text: self.required_text(state.text)?,
+                trigger: state.trigger.clone(),
+                transitions,
+            });
+        }
+        Ok(DialogueContent {
+            id: id.clone(),
+            states,
+        })
+    }
+
+    fn optional_text(&self, strref: u32) -> Result<Option<String>, ContentError> {
+        if strref == u32::MAX {
+            return Ok(None);
+        }
+        self.strings.text(strref).map(Some).ok_or_else(|| {
+            ContentError::Invalid(format!("TLK string reference {strref} is missing"))
+        })
+    }
+
+    fn required_text(&self, strref: u32) -> Result<String, ContentError> {
+        self.optional_text(strref)?.ok_or_else(|| {
+            ContentError::Invalid(format!("required TLK string reference {strref} is absent"))
+        })
     }
 }
 

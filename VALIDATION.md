@@ -34,8 +34,10 @@ Check the following:
 - Fountain and smoke BAMs blend over the area without black rectangles.
 - The selected Xvart has a green selection ellipse.
 - ARE actors appear as color-coded humanoid/animal markers. Right-clicking one
-  makes the Xvart approach it and opens a prototype conversation panel once in
-  range; `Esc` closes the panel.
+  makes the Xvart approach it and opens its localized CRE/DLG/TLK conversation
+  once in range. Number keys `1`–`9` choose visible replies; `Esc` closes it.
+- Keeper of the Portal displays his canonical line beginning “I apologize” and
+  an end/continue option rather than generated prototype text.
 - Left-clicking a reachable point routes the Xvart around blocked search-map
   cells rather than moving in a straight line through scenery.
 - Clicks on castle walls and other blocked terrain are rejected or snapped to
@@ -50,8 +52,10 @@ Check the following:
 Expected limitations for this increment:
 
 - ARE actors use generated markers rather than decoded creature animations.
-- Conversation lines are explicit prototype text; CRE/DLG/TLK state selection
-  and canonical localized dialogue are not decoded yet.
+- Dialogue currently evaluates unconditional, `True()`, and
+  `NumTimesTalkedTo` conditions. Replies guarded by other script conditions are
+  hidden; dialogue actions and cross-DLG transitions are retained but not yet
+  executed.
 - Doors, wall occlusion, WED overlay animation, region activation, area
   transitions, party formations, and save/replay are not implemented yet.
 
@@ -63,4 +67,7 @@ cargo run --offline -p openbg-inspect -- \
 
 cargo run --offline -p openbg-inspect -- \
   "/path/to/Baldur's Gate Enhanced Edition" animation FOUNTN
+
+cargo run --offline -p openbg-inspect -- \
+  "/path/to/Baldur's Gate Enhanced Edition" creature KEEPER
 ```

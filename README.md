@@ -30,10 +30,11 @@ the Xvart resumes a small patrol when it has no player order. The viewer renders
 ARE actors and looping background BAMs (including Candlekeep's fountains), and
 reveals persistent fog as the party explores. Press `F` to toggle fog and `R` to
 show parsed info/travel-region bounds. Right-click an NPC to approach and begin
-a prototype conversation; press `Esc` to close it.
+its CRE/DLG/TLK conversation, press `1`–`9` to choose a visible reply, and press
+`Esc` to close it.
 
 This is an intentionally small M2/M3 slice. WED overlay animation, real creature
-sprites, canonical CRE/DLG/TLK dialogue, doors, walls/occlusion, area
+sprites, full dialogue trigger/action execution, doors, walls/occlusion, area
 transitions, formations, and replayable save/load state remain to be implemented.
 
 ## Goals

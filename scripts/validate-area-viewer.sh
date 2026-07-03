@@ -23,7 +23,7 @@ repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "${repo_root}"
 
 echo "Validating ${area}: animated ARE backgrounds, pathfinding, selection, fog, and regions"
-echo "Visual controls: left-click move; right-click NPC talk; Esc close talk; F fog; R regions"
+echo "Visual controls: left-click move; right-click NPC talk; 1-9 reply; Esc close; F fog; R regions"
 echo "Detailed checklist: ${repo_root}/VALIDATION.md"
 
 exec cargo run --offline -p openbg-area -- "${game_root}" "${area}"

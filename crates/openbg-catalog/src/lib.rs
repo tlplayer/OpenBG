@@ -28,6 +28,7 @@ pub trait ResourceCatalog {
 pub struct GameInstall {
     root: PathBuf,
     index: KeyIndex,
+    dialogue_table: Option<PathBuf>,
 }
 
 impl GameInstall {
@@ -44,7 +45,12 @@ impl GameInstall {
             resource: None,
             source,
         })?;
-        Ok(Self { root, index })
+        let dialogue_table = find_dialogue_table(&root);
+        Ok(Self {
+            root,
+            index,
+            dialogue_table,
+        })
     }
 
     #[must_use]
@@ -53,6 +59,13 @@ impl GameInstall {
     }
 
     fn resolve(&self, id: &ResourceId) -> Result<OwnedResourceData, CatalogError> {
+        if id.kind == ResourceKind::Tlk && id.resref.as_str() == "DIALOG" {
+            let path = self
+                .dialogue_table
+                .as_ref()
+                .ok_or_else(|| CatalogError::NotFound(id.clone()))?;
+            return read(path).map(OwnedResourceData::File);
+        }
         let record = self
             .index
             .find(id)
@@ -85,12 +98,40 @@ impl GameInstall {
 
 impl ResourceCatalog for GameInstall {
     fn contains(&self, id: &ResourceId) -> bool {
+        if id.kind == ResourceKind::Tlk && id.resref.as_str() == "DIALOG" {
+            return self.dialogue_table.is_some();
+        }
         self.index.find(id).is_some()
     }
 
     fn read(&self, id: &ResourceId) -> Result<OwnedResourceData, CatalogError> {
         self.resolve(id)
     }
+}
+
+fn find_dialogue_table(root: &Path) -> Option<PathBuf> {
+    let classic = root.join("dialog.tlk");
+    if classic.is_file() {
+        return Some(classic);
+    }
+    if let Some(locale) = std::env::var_os("OPENBG_LANG") {
+        let configured = root.join("lang").join(locale).join("dialog.tlk");
+        if configured.is_file() {
+            return Some(configured);
+        }
+    }
+    let english = root.join("lang/en_US/dialog.tlk");
+    if english.is_file() {
+        return Some(english);
+    }
+    let mut candidates = fs::read_dir(root.join("lang"))
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path().join("dialog.tlk"))
+        .filter(|path| path.is_file())
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates.into_iter().next()
 }
 
 fn read(path: &Path) -> Result<Vec<u8>, CatalogError> {

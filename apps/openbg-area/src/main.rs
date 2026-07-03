@@ -1,3 +1,4 @@
+use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
@@ -6,10 +7,13 @@ use bevy::asset::RenderAssetUsages;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
 use bevy::render::render_resource::{Extent3d, TextureDimension, TextureFormat};
+use bevy::text::TextBounds;
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use openbg_catalog::GameInstall;
 use openbg_content::{
-    AnimationContent, AnimationLoader, AreaAnimationPlacement, AreaContent, AreaLoader, ImageData,
+    AnimationContent, AnimationLoader, AreaAnimationPlacement, AreaContent, AreaLoader,
+    ConversationLoader, CreatureConversation, DialogueStateContent, DialogueTransitionContent,
+    ImageData,
 };
 use openbg_domain::{GridPoint, ResRef};
 use openbg_sim::find_path;
@@ -24,6 +28,23 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (game_root, area) = arguments()?;
     let install = GameInstall::open(&game_root)?;
     let content = AreaLoader::new(&install).load(&area)?;
+    let conversation_loader = ConversationLoader::new(&install)?;
+    let mut conversations = BTreeMap::new();
+    for creature in content
+        .actors
+        .iter()
+        .filter_map(|actor| actor.creature.as_ref())
+    {
+        if conversations.contains_key(creature) {
+            continue;
+        }
+        match conversation_loader.load_creature(creature) {
+            Ok(conversation) => {
+                conversations.insert(creature.clone(), conversation);
+            }
+            Err(error) => eprintln!("warning: could not load creature {creature}: {error}"),
+        }
+    }
     let area_animations = content
         .animations
         .iter()
@@ -76,6 +97,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             content,
             xvart,
             area_animations,
+            conversations,
         })
         .insert_resource(ConversationState::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -97,6 +119,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 choose_wander_target,
                 move_xvart,
                 finish_npc_approach,
+                choose_dialogue_reply,
                 animate_sprites,
                 reveal_fog,
                 toggle_diagnostics,
@@ -113,6 +136,7 @@ struct LoadedArea {
     content: AreaContent,
     xvart: Option<AnimationContent>,
     area_animations: Vec<LoadedAreaAnimation>,
+    conversations: BTreeMap<ResRef, CreatureConversation>,
 }
 
 struct LoadedAreaAnimation {
@@ -141,7 +165,14 @@ struct ConversationDisplay;
 #[derive(Resource, Default)]
 struct ConversationState {
     pending: Option<Entity>,
-    active: Option<Entity>,
+    active: Option<ActiveConversation>,
+    times_talked: HashMap<Entity, u32>,
+}
+
+#[derive(Clone, Copy)]
+struct ActiveConversation {
+    npc: Entity,
+    state: usize,
 }
 
 #[derive(Component)]
@@ -255,21 +286,28 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
     };
     let npc_image = images.add(bevy_image(&npc_data));
     for actor in &area.content.actors {
+        let conversation = actor
+            .creature
+            .as_ref()
+            .and_then(|creature| area.conversations.get(creature));
+        let display_name = conversation
+            .and_then(|conversation| conversation.display_name.as_deref())
+            .unwrap_or(&actor.name);
         let position = area_to_world(
             actor.position,
             area.content.base.width,
             area.content.base.height,
         );
         let mut sprite = Sprite::from_image(npc_image.clone());
-        sprite.color = npc_color(&actor.name);
+        sprite.color = npc_color(display_name);
         commands.spawn((
             sprite,
             Transform::from_translation(position.extend(8.0)),
             Npc {
-                name: actor.name.clone(),
+                name: display_name.to_owned(),
                 creature: actor.creature.clone(),
             },
-            Name::new(format!("NPC: {}", actor.name)),
+            Name::new(format!("NPC: {display_name}")),
         ));
     }
 
@@ -592,8 +630,15 @@ fn right_click_npc(
         path.waypoints.clear();
         path.next = 0;
         conversation.pending = None;
-        conversation.active = Some(entity);
-        show_conversation(&mut commands, &displays, npc_position, npc);
+        start_conversation(
+            &mut commands,
+            &displays,
+            &area,
+            &mut conversation,
+            entity,
+            npc_position,
+            npc,
+        );
     } else if assign_path(xvart_position, npc_position, &area.content, intent, path).is_some() {
         intent.mode = MovementMode::Player;
         conversation.pending = Some(entity);
@@ -604,6 +649,7 @@ fn right_click_npc(
 
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
 fn finish_npc_approach(
+    area: Res<LoadedArea>,
     npcs: Query<(&Transform, &Npc), Without<Xvart>>,
     mut xvart: Single<
         (&Transform, &mut MovementIntent, &mut NavigationPath),
@@ -634,36 +680,121 @@ fn finish_npc_approach(
     path.waypoints.clear();
     path.next = 0;
     conversation.pending = None;
-    conversation.active = Some(entity);
-    show_conversation(&mut commands, &displays, npc_position, npc);
+    start_conversation(
+        &mut commands,
+        &displays,
+        &area,
+        &mut conversation,
+        entity,
+        npc_position,
+        npc,
+    );
 }
 
-fn show_conversation(
+fn start_conversation(
+    commands: &mut Commands,
+    displays: &Query<Entity, With<ConversationDisplay>>,
+    area: &LoadedArea,
+    conversation: &mut ConversationState,
+    entity: Entity,
+    npc_position: Vec2,
+    npc: &Npc,
+) {
+    let talked = *conversation.times_talked.get(&entity).unwrap_or(&0);
+    let Some(dialogue) = npc
+        .creature
+        .as_ref()
+        .and_then(|creature| area.conversations.get(creature))
+        .and_then(|creature| creature.dialogue.as_ref())
+    else {
+        conversation.active = None;
+        show_conversation_text(
+            commands,
+            displays,
+            npc_position,
+            npc,
+            "This creature has no assigned dialogue.",
+        );
+        return;
+    };
+    if dialogue.states.is_empty() {
+        conversation.active = None;
+        show_conversation_text(
+            commands,
+            displays,
+            npc_position,
+            npc,
+            "The assigned dialogue contains no states.",
+        );
+        return;
+    }
+    let state = dialogue
+        .states
+        .iter()
+        .position(|state| trigger_matches(state.trigger.as_deref(), talked))
+        .unwrap_or(0);
+    conversation.times_talked.insert(entity, talked + 1);
+    conversation.active = Some(ActiveConversation { npc: entity, state });
+    show_dialogue_state(
+        commands,
+        displays,
+        npc_position,
+        npc,
+        &dialogue.states[state],
+        talked,
+    );
+}
+
+fn show_dialogue_state(
     commands: &mut Commands,
     displays: &Query<Entity, With<ConversationDisplay>>,
     npc_position: Vec2,
     npc: &Npc,
+    state: &DialogueStateContent,
+    talked: u32,
+) {
+    let mut text = format!("{}\n{}", npc.name, state.text);
+    let replies = visible_transitions(state, talked);
+    for (number, transition) in replies.iter().take(9).enumerate() {
+        let reply = transition
+            .text
+            .as_deref()
+            .unwrap_or(if transition.terminates {
+                "[End conversation]"
+            } else {
+                "[Continue]"
+            });
+        text.push_str(&format!("\n{}. {reply}", number + 1));
+    }
+    if replies.is_empty() {
+        text.push_str("\n[No currently valid replies — Esc closes]");
+    }
+    show_conversation_text(commands, displays, npc_position, npc, &text);
+}
+
+fn show_conversation_text(
+    commands: &mut Commands,
+    displays: &Query<Entity, With<ConversationDisplay>>,
+    npc_position: Vec2,
+    npc: &Npc,
+    text: &str,
 ) {
     despawn_conversation(commands, displays);
-    let panel_position = npc_position + Vec2::new(0.0, 82.0);
+    let panel_position = npc_position + Vec2::new(0.0, 145.0);
     commands.spawn((
         Sprite::from_color(
             Color::srgba(0.035, 0.025, 0.02, 0.94),
-            Vec2::new(430.0, 92.0),
+            Vec2::new(580.0, 240.0),
         ),
         Transform::from_translation(panel_position.extend(40.0)),
         ConversationDisplay,
         Name::new("Conversation background"),
     ));
-    let creature = npc.creature.as_ref().map_or("embedded", ResRef::as_str);
-    let line = prototype_greeting(&npc.name);
     commands.spawn((
-        Text2d::new(format!(
-            "{}  [{creature}]\n\"{line}\"\nPrototype conversation — Esc closes",
-            npc.name
-        )),
+        Text2d::new(text),
         TextLayout::justify(Justify::Center),
-        TextFont::from_font_size(18.0),
+        TextFont::from_font_size(16.0),
+        TextBounds::new(540.0, 220.0),
         TextColor(Color::srgb(0.96, 0.86, 0.68)),
         Transform::from_translation(panel_position.extend(41.0)),
         ConversationDisplay,
@@ -671,14 +802,141 @@ fn show_conversation(
     ));
 }
 
-fn prototype_greeting(name: &str) -> &'static str {
-    if name.eq_ignore_ascii_case("cow") {
-        "Moo."
-    } else if name.eq_ignore_ascii_case("seagul") {
-        "Squawk!"
-    } else {
-        "Greetings, traveler."
+fn visible_transitions(
+    state: &DialogueStateContent,
+    talked: u32,
+) -> Vec<&DialogueTransitionContent> {
+    state
+        .transitions
+        .iter()
+        .filter(|transition| trigger_matches(transition.trigger.as_deref(), talked))
+        .collect()
+}
+
+fn trigger_matches(trigger: Option<&str>, talked: u32) -> bool {
+    let Some(trigger) = trigger else {
+        return true;
+    };
+    let compact = trigger
+        .chars()
+        .filter(|character| !character.is_whitespace())
+        .collect::<String>()
+        .to_ascii_uppercase();
+    if compact.is_empty() || compact == "TRUE()" {
+        return true;
     }
+    if let Some(argument) = compact
+        .strip_prefix("NUMTIMESTALKEDTO(")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        return talked == argument;
+    }
+    if let Some(argument) = compact
+        .strip_prefix("NUMTIMESTALKEDTOGT(")
+        .and_then(|value| value.strip_suffix(')'))
+        .and_then(|value| value.parse::<u32>().ok())
+    {
+        return talked > argument;
+    }
+    false
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+#[allow(clippy::too_many_arguments)]
+fn choose_dialogue_reply(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    area: Res<LoadedArea>,
+    npcs: Query<(&Transform, &Npc), Without<Xvart>>,
+    displays: Query<Entity, With<ConversationDisplay>>,
+    mut conversation: ResMut<ConversationState>,
+    mut xvart: Single<&mut MovementIntent, With<Xvart>>,
+    mut commands: Commands,
+) {
+    let selected = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ]
+    .iter()
+    .position(|key| keyboard.just_pressed(*key));
+    let (Some(selected), Some(active)) = (selected, conversation.active) else {
+        return;
+    };
+    let Ok((transform, npc)) = npcs.get(active.npc) else {
+        clear_conversation(&mut commands, &displays, &mut conversation);
+        return;
+    };
+    let Some(dialogue) = npc
+        .creature
+        .as_ref()
+        .and_then(|creature| area.conversations.get(creature))
+        .and_then(|creature| creature.dialogue.as_ref())
+    else {
+        return;
+    };
+    let Some(state) = dialogue.states.get(active.state) else {
+        return;
+    };
+    let talked = conversation
+        .times_talked
+        .get(&active.npc)
+        .copied()
+        .unwrap_or(1)
+        .saturating_sub(1);
+    let replies = visible_transitions(state, talked);
+    let Some(reply) = replies.get(selected).copied() else {
+        return;
+    };
+    if let Some(action) = &reply.action {
+        eprintln!("dialogue action retained but not executed yet: {action:?}");
+    }
+    if reply.terminates {
+        clear_conversation(&mut commands, &displays, &mut conversation);
+        xvart.mode = MovementMode::Wander;
+        return;
+    }
+    if reply
+        .next_dialogue
+        .as_ref()
+        .is_some_and(|next| next != &dialogue.id)
+    {
+        show_conversation_text(
+            &mut commands,
+            &displays,
+            transform.translation.truncate(),
+            npc,
+            "This reply continues in another DLG resource; cross-dialogue loading is next.",
+        );
+        return;
+    }
+    let Some(next_state) = reply
+        .next_state
+        .and_then(|state| usize::try_from(state).ok())
+    else {
+        return;
+    };
+    let Some(next) = dialogue.states.get(next_state) else {
+        return;
+    };
+    conversation.active = Some(ActiveConversation {
+        npc: active.npc,
+        state: next_state,
+    });
+    show_dialogue_state(
+        &mut commands,
+        &displays,
+        transform.translation.truncate(),
+        npc,
+        next,
+        talked,
+    );
 }
 
 fn despawn_conversation(
@@ -1078,7 +1336,7 @@ impl Error for ViewerError {
 mod tests {
     use bevy::prelude::Vec2;
 
-    use super::advance_position;
+    use super::{advance_position, trigger_matches};
 
     #[test]
     fn movement_advances_without_overshooting() {
@@ -1093,5 +1351,18 @@ mod tests {
         let (position, arrived) = advance_position(Vec2::ZERO, target, 5.0);
         assert_eq!(position, target);
         assert!(arrived);
+    }
+
+    #[test]
+    fn evaluates_only_the_supported_dialogue_trigger_subset() {
+        assert!(trigger_matches(None, 0));
+        assert!(trigger_matches(Some(" True()\r\n"), 0));
+        assert!(trigger_matches(Some("NumTimesTalkedTo(0)"), 0));
+        assert!(trigger_matches(Some("NumTimesTalkedToGT(2)"), 3));
+        assert!(!trigger_matches(Some("NumTimesTalkedTo(0)"), 1));
+        assert!(!trigger_matches(
+            Some("Global(\"Chapter\",\"GLOBAL\",1)"),
+            0
+        ));
     }
 }

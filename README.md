@@ -24,9 +24,11 @@ cargo run -p openbg-area -- \
 ```
 
 `AR2600` is the default area when the second argument is omitted. Pan with WASD
-or the arrow keys and zoom with the mouse wheel. The viewer currently renders
-only the static base layer; overlays, animated tiles, doors, walls, actors,
-lighting, and fog belong to later slices.
+or the arrow keys, zoom with the mouse wheel, and left-click to move the Xvart.
+When it has no player order, the Xvart walks a small AI patrol. The viewer
+currently renders only the static base layer and a generated actor marker;
+search-map pathfinding, BAM animation, overlays, doors, walls, lighting, and fog
+belong to later slices.
 
 ## Goals
 

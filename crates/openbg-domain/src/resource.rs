@@ -98,6 +98,7 @@ pub enum ResourceKind {
     Bam,
     Bmp,
     Bcs,
+    Bs,
     Bif,
     Cre,
     Dlg,

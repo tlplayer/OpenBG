@@ -3,3 +3,4 @@ target/*
 .data
 .vscode
 target/
+.aider*

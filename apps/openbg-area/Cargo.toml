@@ -18,6 +18,7 @@ bevy = { version = "0.19.0", default-features = false, features = [
 openbg-catalog = { path = "../../crates/openbg-catalog" }
 openbg-content = { path = "../../crates/openbg-content" }
 openbg-domain = { path = "../../crates/openbg-domain" }
+openbg-formats = { path = "../../crates/openbg-formats" }
 openbg-sim = { path = "../../crates/openbg-sim" }
 
 [lints]

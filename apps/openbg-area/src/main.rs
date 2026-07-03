@@ -11,11 +11,13 @@ use bevy::text::TextBounds;
 use bevy::window::{PresentMode, PrimaryWindow, WindowPlugin};
 use openbg_catalog::GameInstall;
 use openbg_content::{
-    AnimationContent, AnimationLoader, AreaAnimationPlacement, AreaContent, AreaLoader,
+    AnimationContent, AnimationLoader, AreaAnimationPlacement, AreaContent, AreaLoader, BcsLoader,
     ConversationLoader, CreatureAnimationContent, CreatureAnimationLoader, CreatureConversation,
-    DialogueStateContent, DialogueTransitionContent, ImageData,
+    CreatureItemContent, DialogueStateContent, DialogueTransitionContent, IdsLoader, ImageData,
+    TwoDaLoader,
 };
 use openbg_domain::{GridPoint, ResRef};
+use openbg_formats::TwoDa;
 use openbg_sim::find_path;
 
 const DEFAULT_AREA: &str = "AR2600";
@@ -28,6 +30,17 @@ fn main() -> Result<(), Box<dyn Error>> {
     let (game_root, area) = arguments()?;
     let install = GameInstall::open(&game_root)?;
     let content = AreaLoader::new(&install).load(&area)?;
+    let start_table = ResRef::new("STARTARE")?;
+    let selected_start = TwoDaLoader::new(&install)
+        .load(&start_table)
+        .ok()
+        .and_then(|table| start_position(&table, &area));
+    if let Some(position) = selected_start {
+        println!(
+            "STARTARE places selected actor in {area} at ({}, {})",
+            position[0], position[1]
+        );
+    }
     let conversation_loader = ConversationLoader::new(&install)?;
     let mut conversations = BTreeMap::new();
     for creature in content
@@ -51,7 +64,11 @@ fn main() -> Result<(), Box<dyn Error>> {
         .iter()
         .map(|actor| {
             creature_animation_loader
-                .load(actor.animation_id, actor.orientation)
+                .load_actor(
+                    actor.animation_id,
+                    actor.orientation,
+                    actor.creature.as_ref(),
+                )
                 .map_err(|error| {
                     eprintln!(
                         "warning: could not load sprite for {} ({:#06x}): {error}",
@@ -61,6 +78,7 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .ok()
         })
         .collect::<Vec<_>>();
+    let scripted_behaviors = load_scripted_behaviors(&install, &content, &conversations);
     let area_animations = content
         .animations
         .iter()
@@ -115,6 +133,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             area_animations,
             creature_animations,
             conversations,
+            selected_start,
+            scripted_behaviors,
         })
         .insert_resource(ConversationState::default())
         .add_plugins(DefaultPlugins.set(WindowPlugin {
@@ -137,7 +157,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 move_xvart,
                 finish_npc_approach,
                 choose_dialogue_reply,
+                inventory_controls,
                 animate_sprites,
+                run_scripted_wander,
                 reveal_fog,
                 toggle_diagnostics,
                 dismiss_conversation,
@@ -155,6 +177,8 @@ struct LoadedArea {
     area_animations: Vec<LoadedAreaAnimation>,
     creature_animations: Vec<Option<CreatureAnimationContent>>,
     conversations: BTreeMap<ResRef, CreatureConversation>,
+    selected_start: Option<[u16; 2]>,
+    scripted_behaviors: Vec<Option<ScriptedBehavior>>,
 }
 
 struct LoadedAreaAnimation {
@@ -175,6 +199,23 @@ struct DestinationMarker;
 struct Npc {
     name: String,
     creature: Option<ResRef>,
+}
+
+#[derive(Component)]
+struct NpcInventory {
+    items: Vec<CreatureItemContent>,
+}
+
+#[derive(Clone)]
+struct ScriptedBehavior {
+    script: ResRef,
+    action: String,
+}
+
+#[derive(Component)]
+struct ScriptedWander {
+    points: [Vec2; 4],
+    next: usize,
 }
 
 #[derive(Component)]
@@ -303,7 +344,13 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
         rgba: make_npc_pixels(),
     };
     let npc_image = images.add(bevy_image(&npc_data));
-    for (actor, animation) in area.content.actors.iter().zip(&area.creature_animations) {
+    for (index, (actor, animation)) in area
+        .content
+        .actors
+        .iter()
+        .zip(&area.creature_animations)
+        .enumerate()
+    {
         let conversation = actor
             .creature
             .as_ref()
@@ -366,6 +413,33 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
         if let Some(frame_animation) = frame_animation {
             entity.insert(frame_animation);
         }
+        if let Some(inventory) = conversation
+            .filter(|creature| !creature.inventory.is_empty())
+            .map(|creature| creature.inventory.clone())
+        {
+            entity.insert(NpcInventory { items: inventory });
+        }
+        if let Some(behavior) = area.scripted_behaviors[index].as_ref() {
+            println!(
+                "script {}: {} executes {}",
+                actor.name, behavior.script, behavior.action
+            );
+            entity.insert((
+                ScriptedWander {
+                    points: [
+                        position + Vec2::new(30.0, 0.0),
+                        position + Vec2::new(30.0, 30.0),
+                        position + Vec2::new(-30.0, 30.0),
+                        position,
+                    ],
+                    next: 0,
+                },
+                Name::new(format!(
+                    "NPC: {display_name} [{}:{}]",
+                    behavior.script, behavior.action
+                )),
+            ));
+        }
     }
 
     for region in &area.content.regions {
@@ -414,7 +488,11 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
             };
             (images.add(bevy_image(&fallback)), 1.5)
         });
-    let requested_start = Vec2::new(-300.0, -180.0);
+    let requested_start = area
+        .selected_start
+        .map_or(Vec2::new(-300.0, -180.0), |position| {
+            area_to_world(position, area.content.base.width, area.content.base.height)
+        });
     let start = snap_to_walkable(requested_start, &area.content).unwrap_or(requested_start);
     let selection_data = ImageData {
         width: 80,
@@ -624,6 +702,80 @@ fn animate_sprites(
             transform.translation.y += offset.y;
         }
     }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn run_scripted_wander(
+    time: Res<Time>,
+    mut actors: Query<(&mut Transform, &mut Sprite, &mut ScriptedWander), Without<Xvart>>,
+) {
+    for (mut transform, mut sprite, mut wander) in &mut actors {
+        let current = transform.translation.truncate();
+        let target = wander.points[wander.next];
+        let (next, arrived) = advance_position(current, target, 45.0 * time.delta_secs());
+        sprite.flip_x = target.x < current.x;
+        transform.translation.x = next.x;
+        transform.translation.y = next.y;
+        if arrived {
+            wander.next = (wander.next + 1) % wander.points.len();
+        }
+    }
+}
+
+fn load_scripted_behaviors(
+    install: &GameInstall,
+    area: &AreaContent,
+    conversations: &BTreeMap<ResRef, CreatureConversation>,
+) -> Vec<Option<ScriptedBehavior>> {
+    let ids = IdsLoader::new(install);
+    let Ok(triggers) = ids.load(&ResRef::new("TRIGGER").expect("fixed resref")) else {
+        return vec![None; area.actors.len()];
+    };
+    let Ok(actions) = ids.load(&ResRef::new("ACTION").expect("fixed resref")) else {
+        return vec![None; area.actors.len()];
+    };
+    let Some(true_id) = triggers.value("True") else {
+        return vec![None; area.actors.len()];
+    };
+    let supported = ["RandomWalk", "RandomWalkContinuous"]
+        .into_iter()
+        .filter_map(|name| actions.value(name).map(|id| (id, name)))
+        .collect::<Vec<_>>();
+    let loader = BcsLoader::new(install);
+    area.actors
+        .iter()
+        .map(|actor| {
+            let scripts = actor
+                .creature
+                .as_ref()
+                .and_then(|creature| conversations.get(creature))?
+                .scripts
+                .clone();
+            [
+                scripts.override_script,
+                scripts.class,
+                scripts.race,
+                scripts.general,
+                scripts.default,
+            ]
+            .into_iter()
+            .flatten()
+            .filter(|script| script.as_str() != "NONE")
+            .find_map(|script| {
+                let compiled = loader.load(&script).ok()?;
+                compiled.blocks.iter().find_map(|block| {
+                    (block.trigger_ids == [true_id]).then_some(())?;
+                    let (_, action) = supported
+                        .iter()
+                        .find(|(id, _)| block.action_ids.contains(id))?;
+                    Some(ScriptedBehavior {
+                        script: script.clone(),
+                        action: (*action).to_owned(),
+                    })
+                })
+            })
+        })
+        .collect()
 }
 
 #[allow(clippy::cast_precision_loss)] // BAM frame dimensions are u16-sized.
@@ -868,6 +1020,107 @@ fn visible_transitions(
         .iter()
         .filter(|transition| trigger_matches(transition.trigger.as_deref(), talked))
         .collect()
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn inventory_controls(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    conversation: Res<ConversationState>,
+    mut npcs: Query<(&Transform, &Npc, &mut NpcInventory, &mut Sprite)>,
+    displays: Query<Entity, With<ConversationDisplay>>,
+    mut commands: Commands,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyI) && !keyboard.just_pressed(KeyCode::KeyE) {
+        return;
+    }
+    let Some(active) = conversation.active else {
+        return;
+    };
+    let Ok((transform, npc, mut inventory, mut sprite)) = npcs.get_mut(active.npc) else {
+        return;
+    };
+    let changed = keyboard
+        .just_pressed(KeyCode::KeyE)
+        .then(|| equip_next_item(&mut inventory.items))
+        .flatten();
+    if let Some(index) = changed {
+        sprite.color = equipment_debug_color(inventory.items[index].item_type);
+    }
+    show_inventory_panel(
+        &mut commands,
+        &displays,
+        transform.translation.truncate(),
+        npc,
+        &inventory.items,
+        changed,
+    );
+}
+
+fn equip_next_item(items: &mut [CreatureItemContent]) -> Option<usize> {
+    let candidate = items
+        .iter()
+        .enumerate()
+        .find(|(_, item)| !item.equipped && equipment_slot(item.item_type).is_some())?
+        .0;
+    let slot = equipment_slot(items[candidate].item_type)?;
+    for item in items.iter_mut() {
+        if item.equipped && item.slot == Some(slot) {
+            item.equipped = false;
+            item.slot = None;
+        }
+    }
+    items[candidate].equipped = true;
+    items[candidate].slot = Some(slot);
+    Some(candidate)
+}
+
+fn equipment_slot(item_type: u16) -> Option<usize> {
+    match item_type {
+        7 => Some(0),  // helmet
+        2 => Some(1),  // armor/robe
+        12 => Some(2), // shield
+        3 => Some(7),  // belt
+        4 => Some(8),  // boots
+        15..=31 => Some(9),
+        32 => Some(17), // cloak
+        _ => None,
+    }
+}
+
+fn equipment_debug_color(item_type: u16) -> Color {
+    match equipment_slot(item_type) {
+        Some(0 | 1 | 2 | 7 | 8 | 17) => Color::srgb(0.72, 0.88, 1.0),
+        Some(_) => Color::srgb(1.0, 0.82, 0.62),
+        None => Color::WHITE,
+    }
+}
+
+fn show_inventory_panel(
+    commands: &mut Commands,
+    displays: &Query<Entity, With<ConversationDisplay>>,
+    npc_position: Vec2,
+    npc: &Npc,
+    items: &[CreatureItemContent],
+    changed: Option<usize>,
+) {
+    let mut text = format!(
+        "{} inventory — I refreshes, E equips next supported item",
+        npc.name
+    );
+    for (index, item) in items.iter().take(12).enumerate() {
+        let marker = if item.equipped { "[equipped]" } else { "" };
+        let changed = if changed == Some(index) {
+            " <- equipped"
+        } else {
+            ""
+        };
+        let name = item.display_name.as_deref().unwrap_or(item.id.as_str());
+        text.push_str(&format!(
+            "\n{marker:10} {name} ({}, slot {:?}, {} lb){changed}",
+            item.id, item.slot, item.weight
+        ));
+    }
+    show_conversation_text(commands, displays, npc_position, npc, &text);
 }
 
 fn trigger_matches(trigger: Option<&str>, talked: u32) -> bool {
@@ -1364,6 +1617,18 @@ fn arguments() -> Result<(PathBuf, ResRef), ViewerError> {
     Ok((game_root, area))
 }
 
+fn start_position(table: &TwoDa, area: &ResRef) -> Option<[u16; 2]> {
+    if !table
+        .get("START_AREA", "VALUE")?
+        .eq_ignore_ascii_case(area.as_str())
+    {
+        return None;
+    }
+    let x = table.get("START_XPOS", "VALUE")?.parse().ok()?;
+    let y = table.get("START_YPOS", "VALUE")?.parse().ok()?;
+    Some([x, y])
+}
+
 #[derive(Debug)]
 enum ViewerError {
     Usage,
@@ -1392,8 +1657,11 @@ impl Error for ViewerError {
 #[cfg(test)]
 mod tests {
     use bevy::prelude::Vec2;
+    use openbg_content::CreatureItemContent;
+    use openbg_domain::ResRef;
+    use openbg_formats::TwoDa;
 
-    use super::{advance_position, trigger_matches};
+    use super::{advance_position, equip_next_item, start_position, trigger_matches};
 
     #[test]
     fn movement_advances_without_overshooting() {
@@ -1421,5 +1689,55 @@ mod tests {
             Some("Global(\"Chapter\",\"GLOBAL\",1)"),
             0
         ));
+    }
+
+    #[test]
+    fn reads_selected_actor_start_from_rules_table() {
+        let table = TwoDa::parse(
+            b"2DA V1.0\nBADVAL\nVALUE\nSTART_AREA AR2600\nSTART_XPOS 1080\nSTART_YPOS 530\n",
+        )
+        .expect("valid start table");
+        let area = ResRef::new("AR2600").expect("valid area");
+        assert_eq!(start_position(&table, &area), Some([1080, 530]));
+        assert_eq!(
+            start_position(&table, &ResRef::new("AR0100").expect("valid area")),
+            None
+        );
+    }
+
+    #[test]
+    fn equips_supported_inventory_item_into_canonical_slot() {
+        let mut items = vec![
+            CreatureItemContent {
+                id: ResRef::new("LEAT01").expect("valid item"),
+                display_name: Some("Leather Armor".into()),
+                item_type: 2,
+                equipped_appearance: "2A".into(),
+                price: 1,
+                weight: 15,
+                charges: [0; 3],
+                flags: 1,
+                slot: Some(1),
+                equipped: true,
+            },
+            CreatureItemContent {
+                id: ResRef::new("PLAT01").expect("valid item"),
+                display_name: Some("Plate Mail".into()),
+                item_type: 2,
+                equipped_appearance: "4A".into(),
+                price: 1,
+                weight: 50,
+                charges: [0; 3],
+                flags: 1,
+                slot: None,
+                equipped: false,
+            },
+        ];
+
+        assert_eq!(equip_next_item(&mut items), Some(1));
+        assert!(!items[0].equipped);
+        assert_eq!(items[0].slot, None);
+        assert!(items[1].equipped);
+        assert_eq!(items[1].slot, Some(1));
     }
 }

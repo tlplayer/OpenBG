@@ -6,8 +6,9 @@ use std::fmt;
 use openbg_catalog::{CatalogError, ResourceCatalog};
 use openbg_domain::{NavigationGrid, ResRef, ResourceId, ResourceKind};
 use openbg_formats::{
-    compose_base_layer, compose_base_layer_with_pages, Are, Bam, Cre, Dlg, FormatError,
-    IndexedBitmap, ResourceData, Tlk, Wed,
+    apply_palette, compose_base_layer, compose_base_layer_with_pages, Are, Bam, Bcs, Cre,
+    CreColors, CreScripts, Dlg, FormatError, Ids, IndexedBitmap, Itm, ResourceData, RgbaBitmap,
+    Tlk, TwoDa, Wed,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -81,7 +82,91 @@ pub struct CreatureAnimationContent {
 pub struct CreatureConversation {
     pub creature: ResRef,
     pub display_name: Option<String>,
+    pub animation_id: u32,
+    pub colors: CreColors,
+    pub scripts: CreScripts,
+    pub inventory: Vec<CreatureItemContent>,
     pub dialogue: Option<DialogueContent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CreatureItemContent {
+    pub id: ResRef,
+    pub display_name: Option<String>,
+    pub item_type: u16,
+    pub equipped_appearance: String,
+    pub price: u32,
+    pub weight: u32,
+    pub charges: [u16; 3],
+    pub flags: u32,
+    pub slot: Option<usize>,
+    pub equipped: bool,
+}
+
+/// Resolves numeric identifier tables used by compiled scripts and rules.
+pub struct IdsLoader<'a, C: ResourceCatalog + ?Sized> {
+    catalog: &'a C,
+}
+
+impl<'a, C: ResourceCatalog + ?Sized> IdsLoader<'a, C> {
+    #[must_use]
+    pub const fn new(catalog: &'a C) -> Self {
+        Self { catalog }
+    }
+
+    /// Loads one IDS resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the resource is absent or malformed.
+    pub fn load(&self, id: &ResRef) -> Result<Ids, ContentError> {
+        let resource = ResourceId::new(id.clone(), ResourceKind::Ids);
+        Ok(Ids::parse(&self.catalog.read_file(&resource)?)?)
+    }
+}
+
+/// Resolves compiled world or character scripts.
+pub struct BcsLoader<'a, C: ResourceCatalog + ?Sized> {
+    catalog: &'a C,
+}
+
+impl<'a, C: ResourceCatalog + ?Sized> BcsLoader<'a, C> {
+    #[must_use]
+    pub const fn new(catalog: &'a C) -> Self {
+        Self { catalog }
+    }
+
+    /// Loads one BCS resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the resource is absent or malformed.
+    pub fn load(&self, id: &ResRef) -> Result<Bcs, ContentError> {
+        let resource = ResourceId::new(id.clone(), ResourceKind::Bcs);
+        Ok(Bcs::parse(&self.catalog.read_file(&resource)?)?)
+    }
+}
+
+/// Resolves item definitions independently from creature inventory placement.
+pub struct ItmLoader<'a, C: ResourceCatalog + ?Sized> {
+    catalog: &'a C,
+}
+
+impl<'a, C: ResourceCatalog + ?Sized> ItmLoader<'a, C> {
+    #[must_use]
+    pub const fn new(catalog: &'a C) -> Self {
+        Self { catalog }
+    }
+
+    /// Loads one ITM resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the resource is absent or malformed.
+    pub fn load(&self, id: &ResRef) -> Result<Itm, ContentError> {
+        let resource = ResourceId::new(id.clone(), ResourceKind::Itm);
+        Ok(Itm::parse(&self.catalog.read_file(&resource)?)?)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -105,6 +190,28 @@ pub struct DialogueTransitionContent {
     pub terminates: bool,
     pub next_dialogue: Option<ResRef>,
     pub next_state: Option<u32>,
+}
+
+/// Resolves typed rules tables without coupling consumers to archive storage.
+pub struct TwoDaLoader<'a, C: ResourceCatalog + ?Sized> {
+    catalog: &'a C,
+}
+
+impl<'a, C: ResourceCatalog + ?Sized> TwoDaLoader<'a, C> {
+    #[must_use]
+    pub const fn new(catalog: &'a C) -> Self {
+        Self { catalog }
+    }
+
+    /// Loads and parses one `2DA V1.0` resource.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the resource is absent or malformed.
+    pub fn load(&self, id: &ResRef) -> Result<TwoDa, ContentError> {
+        let resource = ResourceId::new(id.clone(), ResourceKind::TwoDa);
+        Ok(TwoDa::parse(&self.catalog.read_file(&resource)?)?)
+    }
 }
 
 /// Builds canonical area content without depending on Bevy or filesystem I/O.
@@ -304,6 +411,61 @@ impl<'a, C: ResourceCatalog + ?Sized> CreatureAnimationLoader<'a, C> {
         let animation = AnimationLoader::new(self.catalog).load_first_cycle(&id)?;
         Ok(CreatureAnimationContent { animation, flip_x })
     }
+
+    /// Loads an actor animation, applying its `CRE V1.0` avatar color ramps.
+    ///
+    /// The CRE animation ID is authoritative when present; `fallback_animation_id`
+    /// supports embedded or otherwise unavailable creature data.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the CRE, BAM, or master palette cannot be
+    /// resolved or decoded.
+    pub fn load_actor(
+        &self,
+        fallback_animation_id: u32,
+        orientation: u16,
+        creature: Option<&ResRef>,
+    ) -> Result<CreatureAnimationContent, ContentError> {
+        let Some(creature) = creature else {
+            return self.load(fallback_animation_id, orientation);
+        };
+        let resource = ResourceId::new(creature.clone(), ResourceKind::Cre);
+        let creature = Cre::parse(&self.catalog.read_file(&resource)?)?;
+        let animation_id = if creature.animation_id == 0 {
+            fallback_animation_id
+        } else {
+            creature.animation_id
+        };
+        let (id, flip_x) = creature_animation_resref(animation_id, orientation)?;
+        let resource_id = ResourceId::new(id.clone(), ResourceKind::Bam);
+        let bam = Bam::parse(&self.catalog.read_file(&resource_id)?)?;
+        let cycle = bam
+            .cycles
+            .iter()
+            .find(|cycle| !cycle.frame_indices.is_empty())
+            .ok_or_else(|| ContentError::Invalid(format!("BAM {id} has no animation frames")))?;
+        let palette = if uses_character_color_ranges(animation_id) {
+            Some(self.remapped_palette(&bam, creature.colors)?)
+        } else {
+            None
+        };
+        let animation = animation_content_with_palette(&id, &bam, cycle, palette.as_deref());
+        Ok(CreatureAnimationContent { animation, flip_x })
+    }
+
+    fn remapped_palette(&self, bam: &Bam, colors: CreColors) -> Result<Vec<[u8; 4]>, ContentError> {
+        let master_id = ResourceId::new(
+            ResRef::new("MPAL256").expect("fixed master palette resref is valid"),
+            ResourceKind::Bmp,
+        );
+        let master = RgbaBitmap::parse(&self.catalog.read_file(&master_id)?)?;
+        remap_character_palette(bam, colors, &master)
+    }
+}
+
+fn uses_character_color_ranges(animation_id: u32) -> bool {
+    (0x5000..=0x6315).contains(&animation_id) || animation_id == 0x6402
 }
 
 fn creature_animation_resref(
@@ -356,6 +518,15 @@ fn unsupported_creature_animation<T>(animation_id: u32) -> Result<T, ContentErro
 }
 
 fn animation_content(id: &ResRef, bam: &Bam, cycle: &openbg_formats::BamCycle) -> AnimationContent {
+    animation_content_with_palette(id, bam, cycle, None)
+}
+
+fn animation_content_with_palette(
+    id: &ResRef,
+    bam: &Bam,
+    cycle: &openbg_formats::BamCycle,
+    palette: Option<&[[u8; 4]]>,
+) -> AnimationContent {
     let frames = cycle
         .frame_indices
         .iter()
@@ -365,7 +536,10 @@ fn animation_content(id: &ResRef, bam: &Bam, cycle: &openbg_formats::BamCycle) -
                 image: ImageData {
                     width: u32::from(frame.width),
                     height: u32::from(frame.height),
-                    rgba: frame.rgba.clone(),
+                    rgba: palette.map_or_else(
+                        || frame.rgba.clone(),
+                        |palette| apply_palette(&frame.indices, palette),
+                    ),
                 },
                 center: [frame.center_x, frame.center_y],
             }
@@ -375,6 +549,65 @@ fn animation_content(id: &ResRef, bam: &Bam, cycle: &openbg_formats::BamCycle) -
         id: id.clone(),
         frames,
     }
+}
+
+fn remap_character_palette(
+    bam: &Bam,
+    colors: CreColors,
+    master: &RgbaBitmap,
+) -> Result<Vec<[u8; 4]>, ContentError> {
+    const SHADE_COUNT: usize = 12;
+    const FIRST_COLOR_INDEX: usize = 0x04;
+    let master_width = usize::try_from(master.width)
+        .map_err(|_| ContentError::Invalid("MPAL256 width exceeds usize".into()))?;
+    if master_width < SHADE_COUNT {
+        return Err(ContentError::Invalid(format!(
+            "MPAL256 must contain at least 12 shade columns; got {}x{}",
+            master.width, master.height
+        )));
+    }
+    let mut palette = bam.palette.clone();
+    if palette.len() != 256 {
+        return Err(ContentError::Invalid(format!(
+            "character BAM palette has {} colors instead of 256",
+            palette.len()
+        )));
+    }
+    for (slot, range) in colors.as_array().into_iter().enumerate() {
+        let row = usize::from(range);
+        if row
+            >= usize::try_from(master.height)
+                .map_err(|_| ContentError::Invalid("MPAL256 height exceeds usize".into()))?
+        {
+            return Err(ContentError::Invalid(format!(
+                "CRE color range {range} exceeds MPAL256 height {}",
+                master.height
+            )));
+        }
+        let source = row * master_width;
+        let destination = FIRST_COLOR_INDEX + slot * SHADE_COUNT;
+        for shade in 0..SHADE_COUNT {
+            palette[destination + shade] = master.pixels[source + shade];
+        }
+    }
+    // Character BAMs reuse abbreviated shade bands after the seven primary
+    // ranges. These aliases match the original engine's paperdoll palette.
+    palette.copy_within(0x11..0x19, 0x58); // minor
+    palette.copy_within(0x1d..0x25, 0x60); // major
+    palette.copy_within(0x11..0x19, 0x68); // minor
+    palette.copy_within(0x05..0x0d, 0x70); // metal
+    palette.copy_within(0x35..0x3d, 0x78); // leather
+    palette.copy_within(0x35..0x3d, 0x80); // leather
+    palette.copy_within(0x11..0x19, 0x88); // minor
+    for destination in (0x90..0xa8).step_by(8) {
+        palette.copy_within(0x35..0x3d, destination); // leather
+    }
+    palette.copy_within(0x29..0x31, 0xb0); // skin
+    for destination in (0xb8..0x100).step_by(8) {
+        palette.copy_within(0x35..0x3d, destination); // leather
+    }
+    palette[1] = [0, 0, 0, 255];
+    Ok(palette)
 }
 
 /// Resolves CRE/DLG string references through the installation's `dialog.tlk`.
@@ -415,9 +648,50 @@ impl<'a, C: ResourceCatalog + ?Sized> ConversationLoader<'a, C> {
             .as_ref()
             .map(|dialogue| self.load_dialogue(dialogue))
             .transpose()?;
+        let inventory = creature
+            .inventory
+            .as_ref()
+            .map(|inventory| {
+                inventory
+                    .items
+                    .iter()
+                    .enumerate()
+                    .map(|(index, instance)| {
+                        let item = ItmLoader::new(self.catalog).load(&instance.resource)?;
+                        let identified = instance.flags & 1 != 0;
+                        let name = if identified {
+                            item.identified_name
+                        } else {
+                            item.unidentified_name
+                        };
+                        let slot = inventory
+                            .slots
+                            .iter()
+                            .position(|entry| *entry == Some(index));
+                        Ok(CreatureItemContent {
+                            id: instance.resource.clone(),
+                            display_name: self.optional_text(name)?,
+                            item_type: item.item_type,
+                            equipped_appearance: item.equipped_appearance,
+                            price: item.price,
+                            weight: item.weight,
+                            charges: instance.charges,
+                            flags: instance.flags,
+                            slot,
+                            equipped: slot.is_some_and(|slot| slot <= 17),
+                        })
+                    })
+                    .collect::<Result<Vec<_>, ContentError>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
         Ok(CreatureConversation {
             creature: id.clone(),
             display_name,
+            animation_id: creature.animation_id,
+            colors: creature.colors,
+            scripts: creature.scripts,
+            inventory,
             dialogue,
         })
     }
@@ -528,9 +802,9 @@ impl From<FormatError> for ContentError {
 mod tests {
     use openbg_catalog::{CatalogError, ResourceCatalog};
     use openbg_domain::{ResRef, ResourceId};
-    use openbg_formats::OwnedResourceData;
+    use openbg_formats::{Bam, CreColors, OwnedResourceData, RgbaBitmap};
 
-    use super::{creature_animation_resref, AreaLoader, ContentError};
+    use super::{creature_animation_resref, remap_character_palette, AreaLoader, ContentError};
 
     struct EmptyCatalog;
 
@@ -583,5 +857,44 @@ mod tests {
                 .as_str(),
             "ACOWG1"
         );
+    }
+
+    #[test]
+    fn remaps_primary_and_alias_character_color_bands() {
+        let bam = Bam {
+            frames: Vec::new(),
+            cycles: Vec::new(),
+            palette: vec![[0, 0, 0, 255]; 256],
+            transparent_index: 0,
+        };
+        let mut pixels = Vec::with_capacity(12 * 256);
+        for row in 0_u8..=255 {
+            for shade in 0_u8..12 {
+                pixels.push([row, shade, 0, 255]);
+            }
+        }
+        let master = RgbaBitmap {
+            width: 12,
+            height: 256,
+            pixels,
+        };
+        let colors = CreColors {
+            metal: 1,
+            minor: 2,
+            major: 3,
+            skin: 4,
+            leather: 5,
+            armor: 6,
+            hair: 7,
+        };
+
+        let palette = remap_character_palette(&bam, colors, &master).expect("valid ramps");
+        assert_eq!(palette[0x04], [1, 0, 0, 255]);
+        assert_eq!(palette[0x10], [2, 0, 0, 255]);
+        assert_eq!(palette[0x4c + 11], [7, 11, 0, 255]);
+        assert_eq!(palette[0x58], [2, 1, 0, 255]);
+        assert_eq!(palette[0x70], [1, 1, 0, 255]);
+        assert_eq!(palette[0xb0], [4, 1, 0, 255]);
+        assert_eq!(palette[0xff], [5, 8, 0, 255]);
     }
 }

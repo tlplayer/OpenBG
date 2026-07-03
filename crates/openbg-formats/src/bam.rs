@@ -18,6 +18,7 @@ pub struct BamFrame {
     pub height: u16,
     pub center_x: i16,
     pub center_y: i16,
+    pub indices: Vec<u8>,
     pub rgba: Vec<u8>,
 }
 
@@ -30,6 +31,8 @@ pub struct BamCycle {
 pub struct Bam {
     pub frames: Vec<BamFrame>,
     pub cycles: Vec<BamCycle>,
+    pub palette: Vec<[u8; 4]>,
+    pub transparent_index: u8,
 }
 
 impl Bam {
@@ -94,6 +97,7 @@ impl Bam {
             cycles.push(BamCycle { frame_indices });
         }
 
+        let rgba_palette = decode_palette(palette, transparent_index);
         let mut frames = Vec::with_capacity(frame_count);
         for frame in 0..frame_count {
             let offset = frame_offset + frame * FRAME_ENTRY_SIZE;
@@ -121,10 +125,16 @@ impl Bam {
                 height,
                 center_x: reader.i16(offset + 4)?,
                 center_y: reader.i16(offset + 6)?,
-                rgba: apply_palette(&indices, palette, transparent_index),
+                rgba: apply_palette(&indices, &rgba_palette),
+                indices,
             });
         }
-        Ok(Self { frames, cycles })
+        Ok(Self {
+            frames,
+            cycles,
+            palette: rgba_palette,
+            transparent_index,
+        })
     }
 }
 
@@ -189,16 +199,31 @@ fn decode_rle(
     Ok(output)
 }
 
-fn apply_palette(indices: &[u8], palette: &[u8], transparent_index: u8) -> Vec<u8> {
+fn decode_palette(palette: &[u8], transparent_index: u8) -> Vec<[u8; 4]> {
+    palette
+        .chunks_exact(4)
+        .enumerate()
+        .map(|(index, color)| {
+            [
+                color[2],
+                color[1],
+                color[0],
+                if index == usize::from(transparent_index) {
+                    0
+                } else {
+                    255
+                },
+            ]
+        })
+        .collect()
+}
+
+/// Expands palette indices into RGBA pixels using a possibly remapped palette.
+#[must_use]
+pub fn apply_palette(indices: &[u8], palette: &[[u8; 4]]) -> Vec<u8> {
     let mut rgba = Vec::with_capacity(indices.len() * 4);
     for index in indices.iter().copied() {
-        let palette_offset = usize::from(index) * 4;
-        rgba.extend_from_slice(&[
-            palette[palette_offset + 2],
-            palette[palette_offset + 1],
-            palette[palette_offset],
-            if index == transparent_index { 0 } else { 255 },
-        ]);
+        rgba.extend_from_slice(&palette[usize::from(index)]);
     }
     rgba
 }

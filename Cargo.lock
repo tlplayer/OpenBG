@@ -3035,6 +3035,7 @@ dependencies = [
  "openbg-catalog",
  "openbg-content",
  "openbg-domain",
+ "openbg-formats",
  "openbg-sim",
 ]
 

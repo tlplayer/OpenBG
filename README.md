@@ -32,7 +32,12 @@ background BAMs (including Candlekeep's fountains), and reveals persistent fog
 as the party explores. Press `F` to toggle fog and `R` to show parsed
 info/travel-region bounds. Right-click an NPC to approach and begin its
 CRE/DLG/TLK conversation, press `1`–`9` to choose a visible reply, and press `Esc`
-to close it.
+to close it. The selected actor starts at the position declared by
+`STARTARE.2DA`; supported unconditional `RandomWalk` actions from stock BCS
+scripts move Candlekeep NPCs. During an active NPC conversation, press `I` to
+inspect its real CRE/ITM inventory and `E` to exercise the current equipment-slot
+prototype. The temporary sprite tint makes that equipment change visible until
+equipment BAM overlays are implemented.
 
 This is an intentionally small M2/M3 slice. Full creature animation-family and
 equipment coverage, WED overlay animation, full dialogue trigger/action

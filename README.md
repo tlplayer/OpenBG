@@ -25,23 +25,44 @@ cargo run -p openbg-area -- \
 
 `AR2600` is the default area when the second argument is omitted. Pan with WASD
 or the arrow keys, zoom with the mouse wheel, and left-click to move the selected
-Xvart. Movement follows the area's search map with deterministic pathfinding;
-the Xvart resumes a small patrol when it has no player order. The viewer resolves
+humanoid actor. Movement follows the area's search map with deterministic pathfinding;
+the actor remains idle when it has no player order. Until GAM party loading lands,
+the controllable prototype uses `IMOEN1` for its humanoid animation and initial
+inventory. The viewer resolves
 ARE actor animation IDs into directional creature BAMs, renders looping
 background BAMs (including Candlekeep's fountains), and reveals persistent fog
 as the party explores. Press `F` to toggle fog and `R` to show parsed
 info/travel-region bounds. Right-click an NPC to approach and begin its
 CRE/DLG/TLK conversation, press `1`–`9` to choose a visible reply, and press `Esc`
-to close it. The selected actor starts at the position declared by
+to close it. Dialogue reaction checks use reputation and charisma modifiers from
+`RMODREP.2DA` and `RMODCHR.2DA`; defaults are reputation 10 and charisma 10.
+Press `[`/`]` to lower/raise reputation for dialogue testing, or launch with
+`--reputation 1..20 --charisma 1..25`. The selected actor starts at the position declared by
 `STARTARE.2DA`; supported unconditional `RandomWalk` actions from stock BCS
-scripts move Candlekeep NPCs. During an active NPC conversation, press `I` to
-inspect its real CRE/ITM inventory and `E` to exercise the current equipment-slot
-prototype. The temporary sprite tint makes that equipment change visible until
-equipment BAM overlays are implemented.
+scripts move Candlekeep NPCs. Press `I` at any time to open the persistent player
+inventory. During an active NPC conversation, press `O` to inspect that NPC's real
+CRE/ITM inventory and `E` to exercise the current equipment-slot prototype. The
+temporary sprite tint makes that equipment change visible until equipment BAM
+overlays are implemented.
+
+Entering an active ARE travel region launches its destination area and places
+the player at the region's named entrance. For example, walking into either
+door region in `AR2616` travels to `AR2600` or `AR2617`; the destination is
+disarmed until the player leaves its arrival region, preventing an immediate
+bounce back. This first slice preserves social settings across the handoff;
+GAM/SAV-backed party, inventory, and store persistence remains next.
+
+To test the first store transaction slice, launch `AR2616`, speak to Winthrop,
+choose the friendly/joking reply and then “Sure, what do you have?”. On later
+visits, Winthrop's textless `StartStore` response is shown explicitly as
+`[Open store]`. In the fixed store overlay, `1`–`9` buys an item, `S` sells the
+last inventory item accepted by the store, `I` opens the player inventory,
+`N`/`P` changes pages, and `Esc` closes the store. Gold starts at a temporary
+100 until GAM party state replaces the prototype economy.
 
 This is an intentionally small M2/M3 slice. Full creature animation-family and
 equipment coverage, WED overlay animation, full dialogue trigger/action
-execution, doors, walls/occlusion, area transitions, formations, and replayable
+execution, doors, walls/occlusion, seamless in-process area streaming, formations, and replayable
 save/load state remain to be implemented.
 
 ## Goals

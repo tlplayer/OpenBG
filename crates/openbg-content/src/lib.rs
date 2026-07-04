@@ -8,7 +8,7 @@ use openbg_domain::{NavigationGrid, ResRef, ResourceId, ResourceKind};
 use openbg_formats::{
     apply_palette, compose_base_layer, compose_base_layer_with_pages, Are, Bam, Bcs, Cre,
     CreColors, CreScripts, Dlg, FormatError, Ids, IndexedBitmap, Itm, ResourceData, RgbaBitmap,
-    Tlk, TwoDa, Wed,
+    Sto, Tlk, TwoDa, Wed,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -25,6 +25,7 @@ pub struct AreaContent {
     pub navigation: NavigationGrid,
     pub actors: Vec<ActorPlacement>,
     pub regions: Vec<RegionPlacement>,
+    pub entrances: Vec<EntrancePlacement>,
     pub animations: Vec<AreaAnimationPlacement>,
 }
 
@@ -45,6 +46,13 @@ pub struct RegionPlacement {
     pub destination_area: Option<ResRef>,
     pub destination_entrance: String,
     pub flags: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntrancePlacement {
+    pub name: String,
+    pub position: [u16; 2],
+    pub orientation: u16,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -101,6 +109,32 @@ pub struct CreatureItemContent {
     pub flags: u32,
     pub slot: Option<usize>,
     pub equipped: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreItemContent {
+    pub id: ResRef,
+    pub display_name: Option<String>,
+    pub item_type: u16,
+    pub base_price: u32,
+    pub purchase_price: u32,
+    pub weight: u32,
+    pub charges: [u16; 3],
+    pub flags: u32,
+    pub stock: Option<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoreContent {
+    pub id: ResRef,
+    pub display_name: Option<String>,
+    pub flags: u32,
+    pub sell_markup: u32,
+    pub buy_markup: u32,
+    pub depreciation: u32,
+    pub capacity: u16,
+    pub purchased_item_types: Vec<u32>,
+    pub items: Vec<StoreItemContent>,
 }
 
 /// Resolves numeric identifier tables used by compiled scripts and rules.
@@ -167,6 +201,86 @@ impl<'a, C: ResourceCatalog + ?Sized> ItmLoader<'a, C> {
         let resource = ResourceId::new(id.clone(), ResourceKind::Itm);
         Ok(Itm::parse(&self.catalog.read_file(&resource)?)?)
     }
+}
+
+/// Resolves a store and its item definitions through the installation catalog.
+pub struct StoreLoader<'a, C: ResourceCatalog + ?Sized> {
+    catalog: &'a C,
+    strings: Tlk,
+}
+
+impl<'a, C: ResourceCatalog + ?Sized> StoreLoader<'a, C> {
+    /// Loads `dialog.tlk` for store and item names.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the string table is absent or malformed.
+    pub fn new(catalog: &'a C) -> Result<Self, ContentError> {
+        let id = ResourceId::new(
+            ResRef::new("DIALOG").expect("DIALOG is a valid fixed resref"),
+            ResourceKind::Tlk,
+        );
+        let strings = Tlk::parse(&catalog.read_file(&id)?)?;
+        Ok(Self { catalog, strings })
+    }
+
+    /// Loads one V1 store and resolves its stock item metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ContentError`] when the store, one of its items, or a required
+    /// string reference is absent or malformed.
+    pub fn load(&self, id: &ResRef) -> Result<StoreContent, ContentError> {
+        let resource = ResourceId::new(id.clone(), ResourceKind::Sto);
+        let store = Sto::parse(&self.catalog.read_file(&resource)?)?;
+        let mut items = Vec::with_capacity(store.items.len());
+        for stock in &store.items {
+            let item = ItmLoader::new(self.catalog).load(&stock.resource)?;
+            let identified = stock.infinite || stock.flags & 1 != 0;
+            let name = if identified {
+                item.identified_name
+            } else {
+                item.unidentified_name
+            };
+            items.push(StoreItemContent {
+                id: stock.resource.clone(),
+                display_name: optional_tlk_text(&self.strings, name)?,
+                item_type: item.item_type,
+                base_price: item.price,
+                purchase_price: percentage(item.price, store.sell_markup),
+                weight: item.weight,
+                charges: stock.charges,
+                flags: stock.flags,
+                stock: (!stock.infinite).then_some(stock.stock),
+            });
+        }
+        Ok(StoreContent {
+            id: id.clone(),
+            display_name: optional_tlk_text(&self.strings, store.name)?,
+            flags: store.flags,
+            sell_markup: store.sell_markup,
+            buy_markup: store.buy_markup,
+            depreciation: store.depreciation,
+            capacity: store.capacity,
+            purchased_item_types: store.purchased_item_types,
+            items,
+        })
+    }
+}
+
+fn percentage(value: u32, percent: u32) -> u32 {
+    let scaled = u64::from(value) * u64::from(percent) / 100;
+    u32::try_from(scaled).unwrap_or(u32::MAX)
+}
+
+fn optional_tlk_text(strings: &Tlk, strref: u32) -> Result<Option<String>, ContentError> {
+    if strref == u32::MAX {
+        return Ok(None);
+    }
+    strings
+        .text(strref)
+        .map(Some)
+        .ok_or_else(|| ContentError::Invalid(format!("TLK string reference {strref} is missing")))
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -304,6 +418,15 @@ impl<'a, C: ResourceCatalog + ?Sized> AreaLoader<'a, C> {
                     destination_area: region.destination_area,
                     destination_entrance: region.destination_entrance,
                     flags: region.flags,
+                })
+                .collect(),
+            entrances: are
+                .entrances
+                .into_iter()
+                .map(|entrance| EntrancePlacement {
+                    name: entrance.name,
+                    position: entrance.position,
+                    orientation: entrance.orientation,
                 })
                 .collect(),
             animations: are

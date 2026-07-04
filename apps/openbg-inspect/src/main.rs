@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use openbg_catalog::GameInstall;
 use openbg_content::{
     AnimationLoader, AreaLoader, BcsLoader, ConversationLoader, CreatureAnimationLoader, IdsLoader,
-    ItmLoader, TwoDaLoader,
+    ItmLoader, StoreLoader, TwoDaLoader,
 };
 use openbg_domain::ResRef;
 
@@ -30,7 +30,32 @@ fn main() -> Result<(), Box<dyn Error>> {
         "ids" => inspect_ids(&install, &resource)?,
         "script" => inspect_script(&install, &resource)?,
         "item" => inspect_item(&install, &resource)?,
+        "store" => inspect_store(&install, &resource)?,
         _ => return Err(USAGE.into()),
+    }
+    Ok(())
+}
+
+fn inspect_store(install: &GameInstall, id: &ResRef) -> Result<(), Box<dyn Error>> {
+    let store = StoreLoader::new(install)?.load(id)?;
+    println!(
+        "store {id}: name={:?}, flags={:#x}, charge={}%, pay={}%, stock={}",
+        store.display_name,
+        store.flags,
+        store.sell_markup,
+        store.buy_markup,
+        store.items.len()
+    );
+    for (index, item) in store.items.iter().enumerate() {
+        println!(
+            "  {index:>2}: {} name={:?} price={} base={} stock={:?} type={}",
+            item.id,
+            item.display_name,
+            item.purchase_price,
+            item.base_price,
+            item.stock,
+            item.item_type
+        );
     }
     Ok(())
 }
@@ -128,17 +153,17 @@ fn inspect_table(install: &GameInstall, id: &ResRef) -> Result<(), Box<dyn Error
 
 fn inspect_creature(install: &GameInstall, creature: &ResRef) -> Result<(), Box<dyn Error>> {
     let content = ConversationLoader::new(install)?.load_creature(creature)?;
-    let avatar = CreatureAnimationLoader::new(install).load_actor(
-        content.animation_id,
-        0,
-        Some(creature),
-    )?;
+    let avatar = CreatureAnimationLoader::new(install)
+        .load_actor(content.animation_id, 0, Some(creature))
+        .ok();
     println!(
         "creature {}: name={:?}, animation={:#06x} ({}), colors={{metal={}, minor={}, major={}, skin={}, leather={}, armor={}, hair={}}}, dialogue={}",
         content.creature,
         content.display_name,
         content.animation_id,
-        avatar.animation.id,
+        avatar
+            .as_ref()
+            .map_or("<unmapped>", |avatar| avatar.animation.id.as_str()),
         content.colors.metal,
         content.colors.minor,
         content.colors.major,
@@ -176,9 +201,10 @@ fn inspect_creature(install: &GameInstall, creature: &ResRef) -> Result<(), Box<
             );
             for transition in &state.transitions {
                 println!(
-                    "    reply={:?} trigger={:?} next={:?}:{:?} terminates={}",
+                    "    reply={:?} trigger={:?} action={:?} next={:?}:{:?} terminates={}",
                     transition.text,
                     transition.trigger,
+                    transition.action,
                     transition.next_dialogue,
                     transition.next_state,
                     transition.terminates
@@ -192,7 +218,7 @@ fn inspect_creature(install: &GameInstall, creature: &ResRef) -> Result<(), Box<
 fn inspect_area(install: &GameInstall, area: &ResRef) -> Result<(), Box<dyn Error>> {
     let content = AreaLoader::new(install).load(area)?;
     println!(
-        "area {}: {}x{} RGBA, {}x{} navigation, {} actors, {} regions, {} animations",
+        "area {}: {}x{} RGBA, {}x{} navigation, {} actors, {} regions, {} entrances, {} animations",
         content.id,
         content.base.width,
         content.base.height,
@@ -200,6 +226,7 @@ fn inspect_area(install: &GameInstall, area: &ResRef) -> Result<(), Box<dyn Erro
         content.navigation.height(),
         content.actors.len(),
         content.regions.len(),
+        content.entrances.len(),
         content.animations.len()
     );
     for actor in &content.actors {
@@ -216,11 +243,18 @@ fn inspect_area(install: &GameInstall, area: &ResRef) -> Result<(), Box<dyn Erro
     }
     for region in &content.regions {
         println!(
-            "  region {:<24} kind={} bounds={:?} destination={}",
+            "  region {:<24} kind={} bounds={:?} destination={} entrance={:?}",
             region.name,
             region.kind,
             region.bounds,
-            region.destination_area.as_ref().map_or("-", ResRef::as_str)
+            region.destination_area.as_ref().map_or("-", ResRef::as_str),
+            region.destination_entrance
+        );
+    }
+    for entrance in &content.entrances {
+        println!(
+            "  entrance {:<22} at ({:>5}, {:>5}) orientation={}",
+            entrance.name, entrance.position[0], entrance.position[1], entrance.orientation
         );
     }
     for animation in &content.animations {
@@ -249,4 +283,4 @@ fn inspect_animation(install: &GameInstall, animation: &ResRef) -> Result<(), Bo
     Ok(())
 }
 
-const USAGE: &str = "usage: openbg-inspect <game-directory> area <resref>\n       openbg-inspect <game-directory> animation <resref>\n       openbg-inspect <game-directory> creature <resref>\n       openbg-inspect <game-directory> table <resref>\n       openbg-inspect <game-directory> ids <resref>\n       openbg-inspect <game-directory> script <resref>\n       openbg-inspect <game-directory> item <resref>";
+const USAGE: &str = "usage: openbg-inspect <game-directory> area <resref>\n       openbg-inspect <game-directory> animation <resref>\n       openbg-inspect <game-directory> creature <resref>\n       openbg-inspect <game-directory> table <resref>\n       openbg-inspect <game-directory> ids <resref>\n       openbg-inspect <game-directory> script <resref>\n       openbg-inspect <game-directory> item <resref>\n       openbg-inspect <game-directory> store <resref>";

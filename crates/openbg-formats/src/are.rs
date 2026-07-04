@@ -5,9 +5,11 @@ use crate::FormatError;
 
 const ACTOR_SIZE: usize = 0x110;
 const REGION_SIZE: usize = 0xc4;
+const ENTRANCE_SIZE: usize = 0x68;
 const ANIMATION_SIZE: usize = 0x4c;
 const MAX_ACTORS: usize = 16_384;
 const MAX_REGIONS: usize = 16_384;
+const MAX_ENTRANCES: usize = 16_384;
 const MAX_ANIMATIONS: usize = 16_384;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -32,6 +34,13 @@ pub struct AreRegion {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AreEntrance {
+    pub name: String,
+    pub position: [u16; 2],
+    pub orientation: u16,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct AreAnimation {
     pub name: String,
     pub position: [u16; 2],
@@ -49,6 +58,7 @@ pub struct Are {
     pub wed: ResRef,
     pub actors: Vec<AreActor>,
     pub regions: Vec<AreRegion>,
+    pub entrances: Vec<AreEntrance>,
     pub animations: Vec<AreAnimation>,
 }
 
@@ -82,6 +92,16 @@ impl Are {
             REGION_SIZE,
             "region",
             MAX_REGIONS,
+        )?;
+        let entrance_offset = reader.usize32(0x68)?;
+        let entrance_count = reader.usize32(0x6c)?;
+        validate_table(
+            &reader,
+            entrance_offset,
+            entrance_count,
+            ENTRANCE_SIZE,
+            "entrance",
+            MAX_ENTRANCES,
         )?;
         let animation_count = reader.usize32(0xac)?;
         let animation_offset = reader.usize32(0xb0)?;
@@ -131,6 +151,16 @@ impl Are {
             });
         }
 
+        let mut entrances = Vec::with_capacity(entrance_count);
+        for index in 0..entrance_count {
+            let offset = entrance_offset + index * ENTRANCE_SIZE;
+            entrances.push(AreEntrance {
+                name: text(&reader, offset, 32)?,
+                position: [reader.u16(offset + 0x20)?, reader.u16(offset + 0x22)?],
+                orientation: reader.u16(offset + 0x24)?,
+            });
+        }
+
         let mut animations = Vec::with_capacity(animation_count);
         for index in 0..animation_count {
             let offset = animation_offset + index * ANIMATION_SIZE;
@@ -150,6 +180,7 @@ impl Are {
             wed,
             actors,
             regions,
+            entrances,
             animations,
         })
     }
@@ -229,6 +260,14 @@ mod tests {
         bytes[region + 0x38..region + 0x40].copy_from_slice(b"ARNEXT\0\0");
         bytes[region + 0x40..region + 0x44].copy_from_slice(b"Gate");
 
+        bytes[0x68..0x6c].copy_from_slice(&0x290_u32.to_le_bytes());
+        bytes[0x6c..0x70].copy_from_slice(&1_u32.to_le_bytes());
+        let entrance = 0x290;
+        bytes[entrance..entrance + 4].copy_from_slice(b"Gate");
+        bytes[entrance + 0x20..entrance + 0x22].copy_from_slice(&55_u16.to_le_bytes());
+        bytes[entrance + 0x22..entrance + 0x24].copy_from_slice(&66_u16.to_le_bytes());
+        bytes[entrance + 0x24..entrance + 0x26].copy_from_slice(&8_u16.to_le_bytes());
+
         bytes[0xac..0xb0].copy_from_slice(&1_u32.to_le_bytes());
         bytes[0xb0..0xb4].copy_from_slice(&0x300_u32.to_le_bytes());
         let animation = 0x300;
@@ -256,6 +295,9 @@ mod tests {
                 .map(ResRef::as_str),
             Some("ARNEXT")
         );
+        assert_eq!(area.entrances[0].name, "Gate");
+        assert_eq!(area.entrances[0].position, [55, 66]);
+        assert_eq!(area.entrances[0].orientation, 8);
         assert_eq!(area.animations[0].animation.as_str(), "FOUNTN");
         assert_eq!(area.animations[0].position, [400, 500]);
     }

@@ -113,6 +113,7 @@ fn kind_from_code(code: u16) -> ResourceKind {
         0x03f9 => ResourceKind::Bs,
         0x03f3 => ResourceKind::Dlg,
         0x03f4 => ResourceKind::TwoDa,
+        0x03f6 => ResourceKind::Sto,
         0x03f7 => ResourceKind::Wmp,
         0x0404 => ResourceKind::Pvrz,
         other => ResourceKind::Unknown(other),
@@ -161,8 +162,9 @@ mod tests {
     use super::{kind_from_code, KeyIndex};
 
     #[test]
-    fn maps_rules_table_and_world_map_resource_types() {
+    fn maps_rules_table_store_and_world_map_resource_types() {
         assert_eq!(kind_from_code(0x03f4), ResourceKind::TwoDa);
+        assert_eq!(kind_from_code(0x03f6), ResourceKind::Sto);
         assert_eq!(kind_from_code(0x03f7), ResourceKind::Wmp);
         assert_eq!(kind_from_code(0x03fe), ResourceKind::Unknown(0x03fe));
     }

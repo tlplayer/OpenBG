@@ -2,7 +2,9 @@ use std::collections::{BTreeMap, HashMap};
 use std::error::Error;
 use std::fmt;
 use std::path::PathBuf;
+use std::process::Command;
 
+use bevy::app::AppExit;
 use bevy::asset::RenderAssetUsages;
 use bevy::input::mouse::MouseWheel;
 use bevy::prelude::*;
@@ -14,33 +16,69 @@ use openbg_content::{
     AnimationContent, AnimationLoader, AreaAnimationPlacement, AreaContent, AreaLoader, BcsLoader,
     ConversationLoader, CreatureAnimationContent, CreatureAnimationLoader, CreatureConversation,
     CreatureItemContent, DialogueStateContent, DialogueTransitionContent, IdsLoader, ImageData,
-    TwoDaLoader,
+    StoreContent, StoreItemContent, StoreLoader, TwoDaLoader,
 };
 use openbg_domain::{GridPoint, ResRef};
 use openbg_formats::TwoDa;
 use openbg_sim::find_path;
 
 const DEFAULT_AREA: &str = "AR2600";
-const XVART_SPEED: f32 = 180.0;
+const PLAYER_SPEED: f32 = 180.0;
 const ARRIVAL_DISTANCE: f32 = 2.0;
 const NPC_CLICK_RADIUS: f32 = 36.0;
 const TALK_DISTANCE: f32 = 84.0;
 
 fn main() -> Result<(), Box<dyn Error>> {
-    let (game_root, area) = arguments()?;
+    let ViewerArguments {
+        game_root,
+        area,
+        entrance,
+        reputation,
+        charisma,
+    } = arguments()?;
     let install = GameInstall::open(&game_root)?;
     let content = AreaLoader::new(&install).load(&area)?;
     let start_table = ResRef::new("STARTARE")?;
-    let selected_start = TwoDaLoader::new(&install)
-        .load(&start_table)
-        .ok()
-        .and_then(|table| start_position(&table, &area));
-    if let Some(position) = selected_start {
-        println!(
-            "STARTARE places selected actor in {area} at ({}, {})",
-            position[0], position[1]
-        );
+    let entrance_start = entrance.as_deref().and_then(|requested| {
+        content
+            .entrances
+            .iter()
+            .find(|candidate| candidate.name.eq_ignore_ascii_case(requested))
+            .map(|entrance| entrance.position)
+    });
+    let selected_start = entrance_start.or_else(|| {
+        TwoDaLoader::new(&install)
+            .load(&start_table)
+            .ok()
+            .and_then(|table| start_position(&table, &area))
+    });
+    if entrance_start.is_none() {
+        if let Some(position) = selected_start {
+            println!(
+                "STARTARE places selected actor in {area} at ({}, {})",
+                position[0], position[1]
+            );
+        }
     }
+    if let Some(requested) = &entrance {
+        if entrance_start.is_some() {
+            println!("entered {area} through {requested}");
+        } else {
+            eprintln!("warning: {area} has no entrance named {requested:?}; using fallback start");
+        }
+    }
+    let social_state = load_player_social_state(&install, reputation, charisma);
+    println!(
+        "player social state: reputation={}, charisma={}, reaction={}",
+        social_state.reputation, social_state.charisma, social_state.reaction
+    );
+    let starts_inside_travel_region = selected_start.is_some_and(|position| {
+        content.regions.iter().any(|region| {
+            region.kind == 2
+                && region.destination_area.is_some()
+                && point_in_raw_bounds(position, region.bounds)
+        })
+    });
     let conversation_loader = ConversationLoader::new(&install)?;
     let mut conversations = BTreeMap::new();
     for creature in content
@@ -79,6 +117,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         })
         .collect::<Vec<_>>();
     let scripted_behaviors = load_scripted_behaviors(&install, &content, &conversations);
+    let stores = load_referenced_stores(&install, &conversations);
     let area_animations = content
         .animations
         .iter()
@@ -99,21 +138,33 @@ fn main() -> Result<(), Box<dyn Error>> {
                 .ok()
         })
         .collect::<Vec<_>>();
-    let xvart_id = ResRef::new("MXVTG1")?;
-    let xvart = match AnimationLoader::new(&install).load_first_cycle(&xvart_id) {
-        Ok(animation) => {
-            println!(
-                "loaded {} BAM animation: {} frames",
-                animation.id,
-                animation.frames.len()
-            );
-            Some(animation)
-        }
-        Err(error) => {
-            eprintln!("warning: {error}; using generated Xvart marker");
-            None
-        }
-    };
+    // GAM/CHR-backed protagonist loading is the next persistence slice. Until
+    // then use a stock humanoid CRE for the controllable actor, including its
+    // remapped character palette, instead of the old wandering xvart fixture.
+    let prototype_player_id = ResRef::new("IMOEN1")?;
+    let prototype_player = conversation_loader
+        .load_creature(&prototype_player_id)
+        .map_err(|error| {
+            eprintln!("warning: could not load prototype player {prototype_player_id}: {error}");
+            error
+        })
+        .ok();
+    let player_animation = prototype_player.as_ref().and_then(|creature| {
+        creature_animation_loader
+            .load_actor(creature.animation_id, 0, Some(&prototype_player_id))
+            .map_err(|error| eprintln!("warning: could not load prototype player sprite: {error}"))
+            .ok()
+    });
+    let player_inventory = prototype_player
+        .as_ref()
+        .map(|creature| {
+            creature
+                .inventory
+                .iter()
+                .map(player_item_from_creature)
+                .collect()
+        })
+        .unwrap_or_default();
     println!(
         "loaded {area}: {}x{} pixels, {} actors, {} regions, {}/{} area animations from {}",
         content.base.width,
@@ -128,8 +179,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     App::new()
         .insert_resource(ClearColor(Color::srgb(0.025, 0.025, 0.035)))
         .insert_resource(LoadedArea {
+            game_root,
             content,
-            xvart,
+            player_animation,
             area_animations,
             creature_animations,
             conversations,
@@ -137,6 +189,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             scripted_behaviors,
         })
         .insert_resource(ConversationState::default())
+        .insert_resource(social_state)
+        .insert_resource(TravelState {
+            armed: !starts_inside_travel_region,
+        })
+        .insert_resource(PlayerStoreState {
+            stores,
+            active: None,
+            gold: 100,
+            inventory: player_inventory,
+            inventory_open: false,
+        })
         .add_plugins(DefaultPlugins.set(WindowPlugin {
             primary_window: Some(Window {
                 title: "OpenBG Area Viewer".into(),
@@ -151,13 +214,17 @@ fn main() -> Result<(), Box<dyn Error>> {
             Update,
             (
                 camera_controls,
+                anchor_screen_overlays,
+                adjust_reputation,
                 right_click_npc,
                 click_to_move,
-                choose_wander_target,
                 move_xvart,
+                activate_travel_region,
                 finish_npc_approach,
+                store_controls,
                 choose_dialogue_reply,
-                inventory_controls,
+                player_inventory_controls,
+                npc_inventory_controls,
                 animate_sprites,
                 run_scripted_wander,
                 reveal_fog,
@@ -172,13 +239,36 @@ fn main() -> Result<(), Box<dyn Error>> {
 
 #[derive(Resource)]
 struct LoadedArea {
+    game_root: PathBuf,
     content: AreaContent,
-    xvart: Option<AnimationContent>,
+    player_animation: Option<CreatureAnimationContent>,
     area_animations: Vec<LoadedAreaAnimation>,
     creature_animations: Vec<Option<CreatureAnimationContent>>,
     conversations: BTreeMap<ResRef, CreatureConversation>,
     selected_start: Option<[u16; 2]>,
     scripted_behaviors: Vec<Option<ScriptedBehavior>>,
+}
+
+#[derive(Resource)]
+struct PlayerSocialState {
+    reputation: u8,
+    charisma: u8,
+    reaction: i32,
+    reputation_modifiers: [i32; 20],
+    charisma_modifiers: [i32; 25],
+}
+
+#[derive(Resource)]
+struct TravelState {
+    armed: bool,
+}
+
+impl PlayerSocialState {
+    fn recalculate(&mut self) {
+        self.reaction = 10
+            + self.reputation_modifiers[usize::from(self.reputation - 1)]
+            + self.charisma_modifiers[usize::from(self.charisma - 1)];
+    }
 }
 
 struct LoadedAreaAnimation {
@@ -221,11 +311,32 @@ struct ScriptedWander {
 #[derive(Component)]
 struct ConversationDisplay;
 
+#[derive(Component)]
+struct ScreenOverlay {
+    offset: Vec2,
+}
+
 #[derive(Resource, Default)]
 struct ConversationState {
     pending: Option<Entity>,
     active: Option<ActiveConversation>,
     times_talked: HashMap<Entity, u32>,
+}
+
+#[derive(Resource)]
+struct PlayerStoreState {
+    stores: BTreeMap<ResRef, StoreContent>,
+    active: Option<ActiveStore>,
+    gold: u32,
+    inventory: Vec<StoreItemContent>,
+    inventory_open: bool,
+}
+
+#[derive(Clone)]
+struct ActiveStore {
+    id: ResRef,
+    page: usize,
+    message: Option<String>,
 }
 
 #[derive(Clone, Copy)]
@@ -252,7 +363,7 @@ struct FogOfWar {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MovementMode {
-    Wander,
+    Idle,
     Player,
 }
 
@@ -265,12 +376,6 @@ struct MovementIntent {
 #[derive(Component, Default)]
 struct NavigationPath {
     waypoints: Vec<Vec2>,
-    next: usize,
-}
-
-#[derive(Component)]
-struct WanderRoute {
-    points: [Vec2; 4],
     next: usize,
 }
 
@@ -470,23 +575,24 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
         ));
     }
 
-    let animation_handles = area.xvart.as_ref().map(|animation| {
+    let animation_handles = area.player_animation.as_ref().map(|loaded| {
+        let animation = &loaded.animation;
         animation
             .frames
             .iter()
             .map(|frame| images.add(bevy_image(&frame.image)))
             .collect::<Vec<_>>()
     });
-    let (xvart_handle, scale) = animation_handles
+    let (player_handle, scale) = animation_handles
         .as_ref()
         .and_then(|frames| frames.first().cloned().map(|frame| (frame, 1.0)))
         .unwrap_or_else(|| {
             let fallback = ImageData {
-                width: 64,
-                height: 64,
-                rgba: make_xvart_pixels(),
+                width: 32,
+                height: 48,
+                rgba: make_npc_pixels(),
             };
-            (images.add(bevy_image(&fallback)), 1.5)
+            (images.add(bevy_image(&fallback)), 1.0)
         });
     let requested_start = area
         .selected_start
@@ -506,29 +612,36 @@ fn setup(mut commands: Commands, mut images: ResMut<Assets<Image>>, area: Res<Lo
         SelectionCircle,
         Name::new("Selected party member"),
     ));
+    let mut player_sprite = Sprite::from_image(player_handle);
+    if let Some(loaded) = &area.player_animation {
+        player_sprite.flip_x = loaded.flip_x;
+    }
     let mut xvart = commands.spawn((
-        Sprite::from_image(xvart_handle),
+        player_sprite,
         Transform::from_translation(start.extend(10.0)).with_scale(Vec3::splat(scale)),
         Xvart,
         MovementIntent {
             target: None,
-            mode: MovementMode::Wander,
+            mode: MovementMode::Idle,
         },
         NavigationPath::default(),
-        WanderRoute {
-            points: [
-                Vec2::new(300.0, -180.0),
-                Vec2::new(300.0, 220.0),
-                Vec2::new(-300.0, 220.0),
-                Vec2::new(-300.0, -180.0),
-            ],
-            next: 0,
-        },
-        Name::new("Xvart"),
+        Name::new("Prototype player (IMOEN1 until GAM party loading)"),
     ));
     if let Some(frames) = animation_handles.filter(|frames| frames.len() > 1) {
+        let offsets = area
+            .player_animation
+            .as_ref()
+            .map(|loaded| {
+                loaded
+                    .animation
+                    .frames
+                    .iter()
+                    .map(animation_frame_offset)
+                    .collect()
+            })
+            .unwrap_or_else(|| vec![Vec2::ZERO; frames.len()]);
         xvart.insert(FrameAnimation {
-            offsets: vec![Vec2::ZERO; frames.len()],
+            offsets,
             frames,
             current: 0,
             timer: Timer::from_seconds(0.12, TimerMode::Repeating),
@@ -646,6 +759,24 @@ fn toggle_diagnostics(
                 _ => Visibility::Hidden,
             };
         }
+    }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn adjust_reputation(keyboard: Res<ButtonInput<KeyCode>>, mut social: ResMut<PlayerSocialState>) {
+    let old = social.reputation;
+    if keyboard.just_pressed(KeyCode::BracketLeft) {
+        social.reputation = social.reputation.saturating_sub(1).max(1);
+    }
+    if keyboard.just_pressed(KeyCode::BracketRight) {
+        social.reputation = social.reputation.saturating_add(1).min(20);
+    }
+    if social.reputation != old {
+        social.recalculate();
+        println!(
+            "player reputation={} charisma={} reaction={}",
+            social.reputation, social.charisma, social.reaction
+        );
     }
 }
 
@@ -778,6 +909,92 @@ fn load_scripted_behaviors(
         .collect()
 }
 
+fn load_referenced_stores(
+    install: &GameInstall,
+    conversations: &BTreeMap<ResRef, CreatureConversation>,
+) -> BTreeMap<ResRef, StoreContent> {
+    let Ok(loader) = StoreLoader::new(install) else {
+        return BTreeMap::new();
+    };
+    let mut stores = BTreeMap::new();
+    for id in conversations
+        .values()
+        .filter_map(|creature| creature.dialogue.as_ref())
+        .flat_map(|dialogue| &dialogue.states)
+        .flat_map(|state| &state.transitions)
+        .filter_map(|transition| transition.action.as_deref())
+        .filter_map(start_store_action)
+    {
+        if stores.contains_key(&id) {
+            continue;
+        }
+        match loader.load(&id) {
+            Ok(store) => {
+                stores.insert(id, store);
+            }
+            Err(error) => eprintln!("warning: could not load store {id}: {error}"),
+        }
+    }
+    stores
+}
+
+fn load_player_social_state(
+    install: &GameInstall,
+    reputation: u8,
+    charisma: u8,
+) -> PlayerSocialState {
+    let loader = TwoDaLoader::new(install);
+    let reputation_table = ResRef::new("RMODREP")
+        .ok()
+        .and_then(|id| loader.load(&id).ok());
+    let charisma_table = ResRef::new("RMODCHR")
+        .ok()
+        .and_then(|id| loader.load(&id).ok());
+    let reputation_modifiers = std::array::from_fn(|index| {
+        rule_modifier(
+            reputation_table.as_ref(),
+            u8::try_from(index + 1).unwrap_or(20),
+        )
+    });
+    let charisma_modifiers = std::array::from_fn(|index| {
+        rule_modifier(
+            charisma_table.as_ref(),
+            u8::try_from(index + 1).unwrap_or(25),
+        )
+    });
+    let mut state = PlayerSocialState {
+        reputation,
+        charisma,
+        reaction: 10,
+        reputation_modifiers,
+        charisma_modifiers,
+    };
+    state.recalculate();
+    state
+}
+
+fn rule_modifier(table: Option<&TwoDa>, value: u8) -> i32 {
+    table
+        .and_then(|table| table.get("1", &value.to_string()))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0)
+}
+
+fn start_store_action(action: &str) -> Option<ResRef> {
+    let action = action.trim();
+    let arguments = action.get("StartStore".len()..)?;
+    if !action
+        .get(.."StartStore".len())?
+        .eq_ignore_ascii_case("StartStore")
+        || !arguments.trim_start().starts_with('(')
+    {
+        return None;
+    }
+    let open = action.find('"')? + 1;
+    let close = action[open..].find('"')? + open;
+    ResRef::new(&action[open..close]).ok()
+}
+
 #[allow(clippy::cast_precision_loss)] // BAM frame dimensions are u16-sized.
 fn animation_frame_offset(frame: &openbg_content::AnimationFrame) -> Vec2 {
     Vec2::new(
@@ -793,6 +1010,7 @@ fn right_click_npc(
     window: Single<&Window, With<PrimaryWindow>>,
     camera: Single<(&Camera, &GlobalTransform), With<AreaCamera>>,
     area: Res<LoadedArea>,
+    social: Res<PlayerSocialState>,
     npcs: Query<(Entity, &Transform, &Npc), Without<Xvart>>,
     mut xvart: Single<
         (&Transform, &mut MovementIntent, &mut NavigationPath),
@@ -847,6 +1065,7 @@ fn right_click_npc(
             entity,
             npc_position,
             npc,
+            social.reaction,
         );
     } else if assign_path(xvart_position, npc_position, &area.content, intent, path).is_some() {
         intent.mode = MovementMode::Player;
@@ -859,6 +1078,7 @@ fn right_click_npc(
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
 fn finish_npc_approach(
     area: Res<LoadedArea>,
+    social: Res<PlayerSocialState>,
     npcs: Query<(&Transform, &Npc), Without<Xvart>>,
     mut xvart: Single<
         (&Transform, &mut MovementIntent, &mut NavigationPath),
@@ -897,6 +1117,7 @@ fn finish_npc_approach(
         entity,
         npc_position,
         npc,
+        social.reaction,
     );
 }
 
@@ -908,6 +1129,7 @@ fn start_conversation(
     entity: Entity,
     npc_position: Vec2,
     npc: &Npc,
+    reaction: i32,
 ) {
     let talked = *conversation.times_talked.get(&entity).unwrap_or(&0);
     let Some(dialogue) = npc
@@ -940,7 +1162,7 @@ fn start_conversation(
     let state = dialogue
         .states
         .iter()
-        .position(|state| trigger_matches(state.trigger.as_deref(), talked))
+        .position(|state| trigger_matches(state.trigger.as_deref(), talked, reaction))
         .unwrap_or(0);
     conversation.times_talked.insert(entity, talked + 1);
     conversation.active = Some(ActiveConversation { npc: entity, state });
@@ -951,6 +1173,7 @@ fn start_conversation(
         npc,
         &dialogue.states[state],
         talked,
+        reaction,
     );
 }
 
@@ -961,18 +1184,14 @@ fn show_dialogue_state(
     npc: &Npc,
     state: &DialogueStateContent,
     talked: u32,
+    reaction: i32,
 ) {
-    let mut text = format!("{}\n{}", npc.name, state.text);
-    let replies = visible_transitions(state, talked);
+    let mut text = format!("{} — reaction {}\n{}", npc.name, reaction, state.text);
+    let replies = visible_transitions(state, talked, reaction);
     for (number, transition) in replies.iter().take(9).enumerate() {
-        let reply = transition
-            .text
-            .as_deref()
-            .unwrap_or(if transition.terminates {
-                "[End conversation]"
-            } else {
-                "[Continue]"
-            });
+        let reply = transition.text.as_deref().unwrap_or_else(|| {
+            fallback_dialogue_reply(transition.action.as_deref(), transition.terminates)
+        });
         text.push_str(&format!("\n{}. {reply}", number + 1));
     }
     if replies.is_empty() {
@@ -981,56 +1200,138 @@ fn show_dialogue_state(
     show_conversation_text(commands, displays, npc_position, npc, &text);
 }
 
+fn fallback_dialogue_reply(action: Option<&str>, terminates: bool) -> &'static str {
+    if action.and_then(start_store_action).is_some() {
+        "[Open store]"
+    } else if terminates {
+        "[End conversation]"
+    } else {
+        "[Continue]"
+    }
+}
+
 fn show_conversation_text(
     commands: &mut Commands,
     displays: &Query<Entity, With<ConversationDisplay>>,
-    npc_position: Vec2,
+    _npc_position: Vec2,
     npc: &Npc,
     text: &str,
 ) {
+    show_overlay_text(
+        commands,
+        displays,
+        &format!("Conversation with {}", npc.name),
+        text,
+    );
+}
+
+fn show_overlay_text(
+    commands: &mut Commands,
+    displays: &Query<Entity, With<ConversationDisplay>>,
+    name: &str,
+    text: &str,
+) {
     despawn_conversation(commands, displays);
-    let panel_position = npc_position + Vec2::new(0.0, 145.0);
     commands.spawn((
         Sprite::from_color(
-            Color::srgba(0.035, 0.025, 0.02, 0.94),
-            Vec2::new(580.0, 240.0),
+            Color::srgba(0.035, 0.025, 0.02, 0.96),
+            Vec2::new(1020.0, 380.0),
         ),
-        Transform::from_translation(panel_position.extend(40.0)),
+        Transform::from_xyz(0.0, 0.0, 100.0),
+        ScreenOverlay {
+            offset: Vec2::new(0.0, -145.0),
+        },
         ConversationDisplay,
-        Name::new("Conversation background"),
+        Name::new(format!("{name} background")),
     ));
     commands.spawn((
         Text2d::new(text),
-        TextLayout::justify(Justify::Center),
+        TextLayout::justify(Justify::Left),
         TextFont::from_font_size(16.0),
-        TextBounds::new(540.0, 220.0),
+        TextBounds::new(970.0, 340.0),
         TextColor(Color::srgb(0.96, 0.86, 0.68)),
-        Transform::from_translation(panel_position.extend(41.0)),
+        Transform::from_xyz(0.0, 0.0, 101.0),
+        ScreenOverlay {
+            offset: Vec2::new(0.0, -145.0),
+        },
         ConversationDisplay,
-        Name::new(format!("Conversation with {}", npc.name)),
+        Name::new(name.to_owned()),
     ));
 }
 
 fn visible_transitions(
     state: &DialogueStateContent,
     talked: u32,
+    reaction: i32,
 ) -> Vec<&DialogueTransitionContent> {
     state
         .transitions
         .iter()
-        .filter(|transition| trigger_matches(transition.trigger.as_deref(), talked))
+        .filter(|transition| trigger_matches(transition.trigger.as_deref(), talked, reaction))
         .collect()
 }
 
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
-fn inventory_controls(
+fn player_inventory_controls(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<PlayerStoreState>,
+    mut conversation: ResMut<ConversationState>,
+    displays: Query<Entity, With<ConversationDisplay>>,
+    mut commands: Commands,
+) {
+    if !keyboard.just_pressed(KeyCode::KeyI) {
+        return;
+    }
+    state.inventory_open = !state.inventory_open;
+    if state.inventory_open {
+        conversation.pending = None;
+        conversation.active = None;
+        show_player_inventory_panel(&mut commands, &displays, &state);
+    } else if state.active.is_some() {
+        show_store_panel(&mut commands, &displays, &state);
+    } else {
+        despawn_conversation(&mut commands, &displays);
+    }
+}
+
+fn show_player_inventory_panel(
+    commands: &mut Commands,
+    displays: &Query<Entity, With<ConversationDisplay>>,
+    state: &PlayerStoreState,
+) {
+    let mut text = format!(
+        "PLAYER INVENTORY — gold: {} — {} item(s)\nI closes inventory",
+        state.gold,
+        state.inventory.len()
+    );
+    if state.inventory.is_empty() {
+        text.push_str("\n(empty)");
+    }
+    for (index, item) in state.inventory.iter().take(16).enumerate() {
+        text.push_str(&format!(
+            "\n{}. {} ({}, {} lb, base {} gp)",
+            index + 1,
+            store_item_name(item),
+            item.id,
+            item.weight,
+            item.base_price
+        ));
+    }
+    if state.inventory.len() > 16 {
+        text.push_str(&format!("\n… and {} more", state.inventory.len() - 16));
+    }
+    show_overlay_text(commands, displays, "Player inventory", &text);
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn npc_inventory_controls(
     keyboard: Res<ButtonInput<KeyCode>>,
     conversation: Res<ConversationState>,
     mut npcs: Query<(&Transform, &Npc, &mut NpcInventory, &mut Sprite)>,
     displays: Query<Entity, With<ConversationDisplay>>,
     mut commands: Commands,
 ) {
-    if !keyboard.just_pressed(KeyCode::KeyI) && !keyboard.just_pressed(KeyCode::KeyE) {
+    if !keyboard.just_pressed(KeyCode::KeyO) && !keyboard.just_pressed(KeyCode::KeyE) {
         return;
     }
     let Some(active) = conversation.active else {
@@ -1104,7 +1405,7 @@ fn show_inventory_panel(
     changed: Option<usize>,
 ) {
     let mut text = format!(
-        "{} inventory — I refreshes, E equips next supported item",
+        "{} NPC inventory — O refreshes, E equips next supported item",
         npc.name
     );
     for (index, item) in items.iter().take(12).enumerate() {
@@ -1123,7 +1424,7 @@ fn show_inventory_panel(
     show_conversation_text(commands, displays, npc_position, npc, &text);
 }
 
-fn trigger_matches(trigger: Option<&str>, talked: u32) -> bool {
+fn trigger_matches(trigger: Option<&str>, talked: u32, reaction: i32) -> bool {
     let Some(trigger) = trigger else {
         return true;
     };
@@ -1149,6 +1450,30 @@ fn trigger_matches(trigger: Option<&str>, talked: u32) -> bool {
     {
         return talked > argument;
     }
+    for (prefix, compare) in [
+        (
+            "REACTIONLT(LASTTALKEDTOBY,",
+            i32::lt as fn(&i32, &i32) -> bool,
+        ),
+        (
+            "REACTIONGT(LASTTALKEDTOBY,",
+            i32::gt as fn(&i32, &i32) -> bool,
+        ),
+    ] {
+        if let Some(symbol) = compact
+            .strip_prefix(prefix)
+            .and_then(|value| value.strip_suffix(')'))
+        {
+            let threshold = match symbol {
+                "HOSTILE_UPPER" => 7,
+                "NEUTRAL_LOWER" => 8,
+                "NEUTRAL_UPPER" => 14,
+                "FRIENDLY_LOWER" => 15,
+                _ => return false,
+            };
+            return compare(&reaction, &threshold);
+        }
+    }
     false
 }
 
@@ -1157,12 +1482,17 @@ fn trigger_matches(trigger: Option<&str>, talked: u32) -> bool {
 fn choose_dialogue_reply(
     keyboard: Res<ButtonInput<KeyCode>>,
     area: Res<LoadedArea>,
+    social: Res<PlayerSocialState>,
     npcs: Query<(&Transform, &Npc), Without<Xvart>>,
     displays: Query<Entity, With<ConversationDisplay>>,
     mut conversation: ResMut<ConversationState>,
+    mut store_state: ResMut<PlayerStoreState>,
     mut xvart: Single<&mut MovementIntent, With<Xvart>>,
     mut commands: Commands,
 ) {
+    if store_state.active.is_some() {
+        return;
+    }
     let selected = [
         KeyCode::Digit1,
         KeyCode::Digit2,
@@ -1200,16 +1530,39 @@ fn choose_dialogue_reply(
         .copied()
         .unwrap_or(1)
         .saturating_sub(1);
-    let replies = visible_transitions(state, talked);
+    let replies = visible_transitions(state, talked, social.reaction);
     let Some(reply) = replies.get(selected).copied() else {
         return;
     };
-    if let Some(action) = &reply.action {
+    if let Some(store) = reply.action.as_deref().and_then(start_store_action) {
+        if store_state.stores.contains_key(&store) {
+            conversation.pending = None;
+            conversation.active = None;
+            store_state.active = Some(ActiveStore {
+                id: store,
+                page: 0,
+                message: None,
+            });
+            store_state.inventory_open = false;
+            xvart.mode = MovementMode::Idle;
+            show_store_panel(&mut commands, &displays, &store_state);
+            return;
+        }
+        eprintln!("dialogue requested unavailable store {store}");
+        show_conversation_text(
+            &mut commands,
+            &displays,
+            transform.translation.truncate(),
+            npc,
+            &format!("Store {store} could not be loaded."),
+        );
+        return;
+    } else if let Some(action) = &reply.action {
         eprintln!("dialogue action retained but not executed yet: {action:?}");
     }
     if reply.terminates {
         clear_conversation(&mut commands, &displays, &mut conversation);
-        xvart.mode = MovementMode::Wander;
+        xvart.mode = MovementMode::Idle;
         return;
     }
     if reply
@@ -1246,6 +1599,7 @@ fn choose_dialogue_reply(
         npc,
         next,
         talked,
+        social.reaction,
     );
 }
 
@@ -1273,13 +1627,220 @@ fn dismiss_conversation(
     keyboard: Res<ButtonInput<KeyCode>>,
     displays: Query<Entity, With<ConversationDisplay>>,
     mut conversation: ResMut<ConversationState>,
+    mut store: ResMut<PlayerStoreState>,
     mut xvart: Single<&mut MovementIntent, With<Xvart>>,
     mut commands: Commands,
 ) {
     if keyboard.just_pressed(KeyCode::Escape) {
+        store.active = None;
+        store.inventory_open = false;
         clear_conversation(&mut commands, &displays, &mut conversation);
-        xvart.mode = MovementMode::Wander;
+        xvart.mode = MovementMode::Idle;
     }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn store_controls(
+    keyboard: Res<ButtonInput<KeyCode>>,
+    mut state: ResMut<PlayerStoreState>,
+    displays: Query<Entity, With<ConversationDisplay>>,
+    mut commands: Commands,
+) {
+    if state.inventory_open {
+        return;
+    }
+    let Some(active) = state.active.clone() else {
+        return;
+    };
+    let selected = [
+        KeyCode::Digit1,
+        KeyCode::Digit2,
+        KeyCode::Digit3,
+        KeyCode::Digit4,
+        KeyCode::Digit5,
+        KeyCode::Digit6,
+        KeyCode::Digit7,
+        KeyCode::Digit8,
+        KeyCode::Digit9,
+    ]
+    .iter()
+    .position(|key| keyboard.just_pressed(*key));
+    let page_size = 9;
+    let mut changed = false;
+    if let Some(selected) = selected {
+        let index = active.page * page_size + selected;
+        let result = buy_store_item(&mut state, &active.id, index);
+        set_store_message(&mut state, result);
+        changed = true;
+    } else if keyboard.just_pressed(KeyCode::KeyS) {
+        let result = sell_last_store_item(&mut state, &active.id);
+        set_store_message(&mut state, result);
+        changed = true;
+    } else if keyboard.just_pressed(KeyCode::KeyN) {
+        let pages = state
+            .stores
+            .get(&active.id)
+            .map_or(1, |store| store.items.len().div_ceil(page_size));
+        if let Some(current) = &mut state.active {
+            current.page = (current.page + 1).min(pages.saturating_sub(1));
+        }
+        changed = true;
+    } else if keyboard.just_pressed(KeyCode::KeyP) {
+        if let Some(current) = &mut state.active {
+            current.page = current.page.saturating_sub(1);
+        }
+        changed = true;
+    }
+    if !changed {
+        return;
+    }
+    show_store_panel(&mut commands, &displays, &state);
+}
+
+fn set_store_message(state: &mut PlayerStoreState, result: Result<String, String>) {
+    if let Some(active) = &mut state.active {
+        active.message = Some(result.unwrap_or_else(|error| error));
+    }
+}
+
+fn buy_store_item(
+    state: &mut PlayerStoreState,
+    store_id: &ResRef,
+    index: usize,
+) -> Result<String, String> {
+    let store = state
+        .stores
+        .get(store_id)
+        .ok_or_else(|| format!("Store {store_id} is unavailable"))?;
+    if store.flags & 1 == 0 {
+        return Err("This store does not sell items".into());
+    }
+    let item = store
+        .items
+        .get(index)
+        .cloned()
+        .ok_or_else(|| "No item is assigned to that number".to_owned())?;
+    if item.stock == Some(0) {
+        return Err(format!("{} is out of stock", store_item_name(&item)));
+    }
+    if state.gold < item.purchase_price {
+        return Err(format!(
+            "Need {} gold for {} (you have {})",
+            item.purchase_price,
+            store_item_name(&item),
+            state.gold
+        ));
+    }
+    state.gold -= item.purchase_price;
+    state.inventory.push(item.clone());
+    if let Some(stock) = state
+        .stores
+        .get_mut(store_id)
+        .and_then(|store| store.items.get_mut(index))
+        .and_then(|item| item.stock.as_mut())
+    {
+        *stock = stock.saturating_sub(1);
+    }
+    Ok(format!(
+        "Bought {} for {} gold",
+        store_item_name(&item),
+        item.purchase_price
+    ))
+}
+
+fn sell_last_store_item(state: &mut PlayerStoreState, store_id: &ResRef) -> Result<String, String> {
+    let item = state
+        .inventory
+        .last()
+        .cloned()
+        .ok_or_else(|| "Your store-test inventory is empty".to_owned())?;
+    let store = state
+        .stores
+        .get(store_id)
+        .ok_or_else(|| format!("Store {store_id} is unavailable"))?;
+    if store.flags & (1 << 1) == 0 {
+        return Err("This store does not buy items".into());
+    }
+    if !store
+        .purchased_item_types
+        .contains(&u32::from(item.item_type))
+    {
+        return Err(format!("The store will not buy {}", store_item_name(&item)));
+    }
+    let payment = store_percentage(item.base_price, store.buy_markup);
+    state.inventory.pop();
+    state.gold = state.gold.saturating_add(payment);
+    if let Some(stock) = state
+        .stores
+        .get_mut(store_id)
+        .and_then(|store| store.items.iter_mut().find(|stock| stock.id == item.id))
+        .and_then(|stock| stock.stock.as_mut())
+    {
+        *stock = stock.saturating_add(1);
+    }
+    Ok(format!(
+        "Sold {} for {payment} gold",
+        store_item_name(&item)
+    ))
+}
+
+fn store_percentage(value: u32, percent: u32) -> u32 {
+    let scaled = u64::from(value) * u64::from(percent) / 100;
+    u32::try_from(scaled).unwrap_or(u32::MAX)
+}
+
+fn store_item_name(item: &StoreItemContent) -> &str {
+    item.display_name.as_deref().unwrap_or(item.id.as_str())
+}
+
+fn player_item_from_creature(item: &CreatureItemContent) -> StoreItemContent {
+    StoreItemContent {
+        id: item.id.clone(),
+        display_name: item.display_name.clone(),
+        item_type: item.item_type,
+        base_price: item.price,
+        purchase_price: item.price,
+        weight: item.weight,
+        charges: item.charges,
+        flags: item.flags,
+        stock: None,
+    }
+}
+
+fn show_store_panel(
+    commands: &mut Commands,
+    displays: &Query<Entity, With<ConversationDisplay>>,
+    state: &PlayerStoreState,
+) {
+    let Some(active) = state.active.as_ref() else {
+        return;
+    };
+    let Some(store) = state.stores.get(&active.id) else {
+        return;
+    };
+    let page_size = 9;
+    let pages = store.items.len().div_ceil(page_size).max(1);
+    let start = active.page * page_size;
+    let title = store.display_name.as_deref().unwrap_or(store.id.as_str());
+    let mut text = format!(
+        "STORE: {title} — gold: {} — page {}/{}\n1-9 buy · S sell last item · I inventory · N/P pages · Esc close",
+        state.gold,
+        active.page + 1,
+        pages
+    );
+    if let Some(message) = &active.message {
+        text.push_str(&format!("\n{message}"));
+    }
+    for (visible, item) in store.items.iter().skip(start).take(page_size).enumerate() {
+        let stock = item.stock.map_or("∞".to_owned(), |stock| stock.to_string());
+        text.push_str(&format!(
+            "\n{}. {} — {} gp — stock {stock}",
+            visible + 1,
+            store_item_name(item),
+            item.purchase_price
+        ));
+    }
+    show_overlay_text(commands, displays, &format!("Store: {title}"), &text);
 }
 
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
@@ -1332,33 +1893,6 @@ fn click_to_move(
 }
 
 #[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
-fn choose_wander_target(
-    area: Res<LoadedArea>,
-    mut xvart: Single<
-        (
-            &Transform,
-            &mut MovementIntent,
-            &mut NavigationPath,
-            &mut WanderRoute,
-        ),
-        With<Xvart>,
-    >,
-) {
-    let (transform, intent, path, route) = &mut *xvart;
-    if intent.mode == MovementMode::Wander && intent.target.is_none() {
-        let requested = route.points[route.next];
-        route.next = (route.next + 1) % route.points.len();
-        assign_path(
-            transform.translation.truncate(),
-            requested,
-            &area.content,
-            intent,
-            path,
-        );
-    }
-}
-
-#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
 fn move_xvart(
     time: Res<Time>,
     mut xvart: Single<
@@ -1378,7 +1912,7 @@ fn move_xvart(
         return;
     };
     let current = transform.translation.truncate();
-    let (next, arrived) = advance_position(current, target, XVART_SPEED * time.delta_secs());
+    let (next, arrived) = advance_position(current, target, PLAYER_SPEED * time.delta_secs());
     sprite.flip_x = target.x < current.x;
     transform.translation.x = next.x;
     transform.translation.y = next.y;
@@ -1390,7 +1924,7 @@ fn move_xvart(
         } else {
             let was_player_order = intent.mode == MovementMode::Player;
             intent.target = None;
-            intent.mode = MovementMode::Wander;
+            intent.mode = MovementMode::Idle;
             path.waypoints.clear();
             path.next = 0;
             if was_player_order {
@@ -1400,6 +1934,83 @@ fn move_xvart(
             }
         }
     }
+}
+
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn activate_travel_region(
+    area: Res<LoadedArea>,
+    social: Res<PlayerSocialState>,
+    player: Single<&Transform, With<Xvart>>,
+    mut travel: ResMut<TravelState>,
+    mut exit: MessageWriter<AppExit>,
+) {
+    let world = player.translation.truncate();
+    let inside = area
+        .content
+        .regions
+        .iter()
+        .filter(|region| region.kind == 2 && region.destination_area.is_some())
+        .find(|region| point_in_area_bounds(world, region.bounds, &area.content));
+    if !travel.armed {
+        if inside.is_none() {
+            travel.armed = true;
+        }
+        return;
+    }
+    let Some(region) = inside else {
+        return;
+    };
+    let Some(destination) = region.destination_area.as_ref() else {
+        return;
+    };
+    let Ok(executable) = std::env::current_exe() else {
+        eprintln!("could not resolve current executable for area transition");
+        return;
+    };
+    let mut command = Command::new(executable);
+    command
+        .arg(&area.game_root)
+        .arg(destination.as_str())
+        .arg("--reputation")
+        .arg(social.reputation.to_string())
+        .arg("--charisma")
+        .arg(social.charisma.to_string());
+    if !region.destination_entrance.is_empty() {
+        command.arg("--entrance").arg(&region.destination_entrance);
+    }
+    match command.spawn() {
+        Ok(_) => {
+            travel.armed = false;
+            println!(
+                "travel region {}: {} -> {} entrance {:?}",
+                region.name, area.content.id, destination, region.destination_entrance
+            );
+            exit.write(AppExit::Success);
+        }
+        Err(error) => eprintln!("could not launch destination area {destination}: {error}"),
+    }
+}
+
+#[allow(clippy::cast_precision_loss)] // Infinity coordinates are bounded to u16.
+fn point_in_area_bounds(world: Vec2, bounds: [u16; 4], area: &AreaContent) -> bool {
+    point_in_pixel_bounds(world, bounds, area.base.width, area.base.height)
+}
+
+#[allow(clippy::cast_precision_loss)] // Infinity coordinates are bounded to u16.
+fn point_in_pixel_bounds(world: Vec2, bounds: [u16; 4], width: u32, height: u32) -> bool {
+    let x = world.x + width as f32 * 0.5;
+    let y = height as f32 * 0.5 - world.y;
+    x >= f32::from(bounds[0])
+        && x <= f32::from(bounds[2])
+        && y >= f32::from(bounds[1])
+        && y <= f32::from(bounds[3])
+}
+
+fn point_in_raw_bounds(position: [u16; 2], bounds: [u16; 4]) -> bool {
+    position[0] >= bounds[0]
+        && position[0] <= bounds[2]
+        && position[1] >= bounds[1]
+        && position[1] <= bounds[3]
 }
 
 fn assign_path(
@@ -1468,46 +2079,6 @@ fn advance_position(current: Vec2, target: Vec2, maximum_distance: f32) -> (Vec2
     } else {
         (current + offset / distance * maximum_distance, false)
     }
-}
-
-fn make_xvart_pixels() -> Vec<u8> {
-    let mut pixels = vec![0_u8; 64 * 64 * 4];
-    for pixel_y in 0..64_usize {
-        for pixel_x in 0..64_usize {
-            let x = i32::try_from(pixel_x).expect("sprite X coordinate fits i32");
-            let y = i32::try_from(pixel_y).expect("sprite Y coordinate fits i32");
-            let selection = {
-                let dx = x - 32;
-                let dy = (y - 56) * 3;
-                let radius = dx * dx + dy * dy;
-                (650..=900).contains(&radius)
-            };
-            let legs = ((23..=29).contains(&x) || (35..=41).contains(&x)) && (43..=55).contains(&y);
-            let body = ellipse(x, y, 32, 39, 12, 17);
-            let ears = ((10..=20).contains(&x) || (44..=54).contains(&x)) && (13..=25).contains(&y);
-            let head = ellipse(x, y, 32, 23, 15, 13);
-            let eye = ellipse(x, y, 27, 21, 3, 4) || ellipse(x, y, 37, 21, 3, 4);
-            let pupil = (x == 28 || x == 38) && (20..=22).contains(&y);
-            let mouth = (27..=37).contains(&x) && y == 29;
-
-            let color = if pupil || mouth {
-                Some([20, 18, 28, 255])
-            } else if eye {
-                Some([240, 238, 210, 255])
-            } else if head || ears || body || legs {
-                Some([45, 105, 205, 255])
-            } else if selection {
-                Some([60, 255, 80, 210])
-            } else {
-                None
-            };
-            if let Some(color) = color {
-                let index = (pixel_y * 64 + pixel_x) * 4;
-                pixels[index..index + 4].copy_from_slice(&color);
-            }
-        }
-    }
-    pixels
 }
 
 fn make_selection_pixels(width: usize, height: usize) -> Vec<u8> {
@@ -1602,7 +2173,33 @@ fn camera_controls(
     }
 }
 
-fn arguments() -> Result<(PathBuf, ResRef), ViewerError> {
+#[allow(clippy::needless_pass_by_value)] // Bevy system parameters are value wrappers.
+fn anchor_screen_overlays(
+    camera: Single<(&Transform, &Projection), (With<AreaCamera>, Without<ScreenOverlay>)>,
+    mut overlays: Query<(&ScreenOverlay, &mut Transform), Without<AreaCamera>>,
+) {
+    let (camera_transform, projection) = *camera;
+    let scale = match projection {
+        Projection::Orthographic(orthographic) => orthographic.scale,
+        _ => 1.0,
+    };
+    for (overlay, mut transform) in &mut overlays {
+        let position = camera_transform.translation.truncate() + overlay.offset * scale;
+        transform.translation.x = position.x;
+        transform.translation.y = position.y;
+        transform.scale = Vec3::splat(scale);
+    }
+}
+
+struct ViewerArguments {
+    game_root: PathBuf,
+    area: ResRef,
+    entrance: Option<String>,
+    reputation: u8,
+    charisma: u8,
+}
+
+fn arguments() -> Result<ViewerArguments, ViewerError> {
     let mut arguments = std::env::args_os().skip(1);
     let game_root = arguments
         .next()
@@ -1614,7 +2211,39 @@ fn arguments() -> Result<(PathBuf, ResRef), ViewerError> {
         .and_then(|value| value.into_string().ok())
         .unwrap_or_else(|| DEFAULT_AREA.to_owned());
     let area = ResRef::new(area).map_err(|error| ViewerError::Data(error.to_string()))?;
-    Ok((game_root, area))
+    let mut entrance = None;
+    let mut reputation = std::env::var("OPENBG_REPUTATION")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
+    let mut charisma = std::env::var("OPENBG_CHARISMA")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(10);
+    while let Some(option) = arguments.next().and_then(|value| value.into_string().ok()) {
+        let value = arguments
+            .next()
+            .and_then(|value| value.into_string().ok())
+            .ok_or(ViewerError::Usage)?;
+        match option.as_str() {
+            "--entrance" => entrance = Some(value),
+            "--reputation" => reputation = value.parse().map_err(|_| ViewerError::Usage)?,
+            "--charisma" => charisma = value.parse().map_err(|_| ViewerError::Usage)?,
+            _ => return Err(ViewerError::Usage),
+        }
+    }
+    if !(1..=20).contains(&reputation) || !(1..=25).contains(&charisma) {
+        return Err(ViewerError::Data(
+            "reputation must be 1..=20 and charisma must be 1..=25".into(),
+        ));
+    }
+    Ok(ViewerArguments {
+        game_root,
+        area,
+        entrance,
+        reputation,
+        charisma,
+    })
 }
 
 fn start_position(table: &TwoDa, area: &ResRef) -> Option<[u16; 2]> {
@@ -1639,7 +2268,7 @@ impl fmt::Display for ViewerError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Usage => formatter.write_str(
-                "usage: openbg-area <game-directory> [area-resref]\n       or set OPENBG_GAME",
+                "usage: openbg-area <game-directory> [area-resref] [--entrance name] [--reputation 1..20] [--charisma 1..25]\n       or set OPENBG_GAME",
             ),
             Self::Data(message) => formatter.write_str(message),
         }
@@ -1656,12 +2285,18 @@ impl Error for ViewerError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
     use bevy::prelude::Vec2;
-    use openbg_content::CreatureItemContent;
+    use openbg_content::{CreatureItemContent, StoreContent, StoreItemContent};
     use openbg_domain::ResRef;
     use openbg_formats::TwoDa;
 
-    use super::{advance_position, equip_next_item, start_position, trigger_matches};
+    use super::{
+        advance_position, buy_store_item, equip_next_item, fallback_dialogue_reply,
+        point_in_pixel_bounds, point_in_raw_bounds, rule_modifier, sell_last_store_item,
+        start_position, start_store_action, trigger_matches, PlayerStoreState,
+    };
 
     #[test]
     fn movement_advances_without_overshooting() {
@@ -1679,15 +2314,62 @@ mod tests {
     }
 
     #[test]
+    fn maps_world_coordinates_into_are_travel_bounds() {
+        assert!(point_in_pixel_bounds(
+            Vec2::new(0.0, 0.0),
+            [40, 40, 60, 60],
+            100,
+            100
+        ));
+        assert!(!point_in_pixel_bounds(
+            Vec2::new(30.0, 0.0),
+            [40, 40, 60, 60],
+            100,
+            100
+        ));
+        assert!(point_in_raw_bounds([547, 494], [547, 451, 680, 576]));
+    }
+
+    #[test]
+    fn reads_reaction_modifier_from_rules_table() {
+        let table = TwoDa::parse(b"2DA V1.0\n0\n 1 2\n1 -7 -6\n")
+            .expect("synthetic reaction modifier table");
+        assert_eq!(rule_modifier(Some(&table), 1), -7);
+        assert_eq!(rule_modifier(Some(&table), 2), -6);
+        assert_eq!(rule_modifier(None, 1), 0);
+    }
+
+    #[test]
     fn evaluates_only_the_supported_dialogue_trigger_subset() {
-        assert!(trigger_matches(None, 0));
-        assert!(trigger_matches(Some(" True()\r\n"), 0));
-        assert!(trigger_matches(Some("NumTimesTalkedTo(0)"), 0));
-        assert!(trigger_matches(Some("NumTimesTalkedToGT(2)"), 3));
-        assert!(!trigger_matches(Some("NumTimesTalkedTo(0)"), 1));
+        assert!(trigger_matches(None, 0, 10));
+        assert!(trigger_matches(Some(" True()\r\n"), 0, 10));
+        assert!(trigger_matches(Some("NumTimesTalkedTo(0)"), 0, 10));
+        assert!(trigger_matches(Some("NumTimesTalkedToGT(2)"), 3, 10));
+        assert!(!trigger_matches(Some("NumTimesTalkedTo(0)"), 1, 10));
         assert!(!trigger_matches(
             Some("Global(\"Chapter\",\"GLOBAL\",1)"),
-            0
+            0,
+            10
+        ));
+        assert!(trigger_matches(
+            Some("ReactionLT(LastTalkedToBy,FRIENDLY_LOWER)"),
+            0,
+            10
+        ));
+        assert!(trigger_matches(
+            Some("ReactionGT(LastTalkedToBy,HOSTILE_UPPER)"),
+            0,
+            10
+        ));
+        assert!(!trigger_matches(
+            Some("ReactionGT(LastTalkedToBy,NEUTRAL_UPPER)"),
+            0,
+            10
+        ));
+        assert!(trigger_matches(
+            Some("ReactionGT(LastTalkedToBy,NEUTRAL_UPPER)"),
+            0,
+            18
         ));
     }
 
@@ -1739,5 +2421,67 @@ mod tests {
         assert_eq!(items[0].slot, None);
         assert!(items[1].equipped);
         assert_eq!(items[1].slot, Some(1));
+    }
+
+    #[test]
+    fn extracts_start_store_dialogue_action() {
+        assert_eq!(
+            start_store_action(" StartStore(\"Inn2616\",LastTalkedToBy(Myself))\r\n")
+                .expect("store action")
+                .as_str(),
+            "INN2616"
+        );
+        assert!(start_store_action("SetGlobal(\"Test\",\"GLOBAL\",1)").is_none());
+        assert!(start_store_action("StartStoreExtra(\"INN2616\")").is_none());
+        assert_eq!(
+            fallback_dialogue_reply(Some("StartStore(\"INN2616\",Player1)"), true),
+            "[Open store]"
+        );
+    }
+
+    #[test]
+    fn store_buy_and_sell_updates_gold_inventory_and_stock() {
+        let id = ResRef::new("INN2616").expect("valid store");
+        let item = StoreItemContent {
+            id: ResRef::new("AX1H01").expect("valid item"),
+            display_name: Some("Battle Axe".into()),
+            item_type: 25,
+            base_price: 5,
+            purchase_price: 7,
+            weight: 7,
+            charges: [0; 3],
+            flags: 1,
+            stock: Some(4),
+        };
+        let store = StoreContent {
+            id: id.clone(),
+            display_name: Some("Candlekeep Inn".into()),
+            flags: 3,
+            sell_markup: 150,
+            buy_markup: 50,
+            depreciation: 0,
+            capacity: 0,
+            purchased_item_types: vec![25],
+            items: vec![item],
+        };
+        let mut stores = BTreeMap::new();
+        stores.insert(id.clone(), store);
+        let mut state = PlayerStoreState {
+            stores,
+            active: None,
+            gold: 100,
+            inventory: Vec::new(),
+            inventory_open: false,
+        };
+
+        assert!(buy_store_item(&mut state, &id, 0).is_ok());
+        assert_eq!(state.gold, 93);
+        assert_eq!(state.inventory.len(), 1);
+        assert_eq!(state.stores[&id].items[0].stock, Some(3));
+
+        assert!(sell_last_store_item(&mut state, &id).is_ok());
+        assert_eq!(state.gold, 95);
+        assert!(state.inventory.is_empty());
+        assert_eq!(state.stores[&id].items[0].stock, Some(4));
     }
 }

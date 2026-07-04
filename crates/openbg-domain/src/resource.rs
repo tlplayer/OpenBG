@@ -109,6 +109,7 @@ pub enum ResourceKind {
     Mos,
     Pvrz,
     Spl,
+    Sto,
     Tis,
     Tlk,
     Wed,

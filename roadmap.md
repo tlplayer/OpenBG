@@ -46,18 +46,19 @@ coverage of every version or field.
 | KEY | Resource index and BIF locator mapping | Add remaining runtime `ResourceKind` mappings and override precedence | AR2600 resources resolve from an installed game |
 | BIF/BIFF | File and tileset extraction | Additional archive variants and catalog diagnostics | AR2600 art and actors load from archives |
 | TLK | String lookup | Alternate language/encoding coverage and external string patches | NPC names and dialogue text appear |
-| ARE | Actors, regions, and area animations | Doors, containers, entrances, traps, embedded CREs, scripts, rest/spawn data | Candlekeep actors, regions, and ambient animations appear |
+| ARE | Actors, regions, named entrances, travel destinations, and area animations | Doors, containers, polygonal triggers, traps, embedded CREs, scripts, rest/spawn data, seamless streaming | Candlekeep travel regions launch the destination area and place the player at the named entrance without bouncing back |
 | WED | Base overlay and navigation-related geometry subset | Doors, wall polygons, occlusion, secondary overlays | Candlekeep base layout renders |
 | TIS | Palette tiles and PVRZ-backed EE tile composition | Animated/secondary tiles and broader edition coverage | Candlekeep ground art renders |
 | PVRZ | Decoding through the TIS composition path | General standalone page service, cache, and diagnostics | EE Candlekeep tiles render |
 | BAM | V1/BAMC frames, cycles, indexed palettes, character recoloring | BAM V2, more animation families, equipment layers, timing metadata | Actors and area animations render; CRE colors are visible |
 | BMP | 4/8-bit indexed and 24-bit images | Other required BMP variants only when encountered | Search map drives movement; `MPAL256` drives avatar colors |
-| CRE | Names, dialogue, animation ID, colors, five script slots, items, and inventory slots | Stats, full equipment behavior, spellbook, effects, death variables, version variants | Imoen uses CRE colors; NPC inventory is visible with `I` |
-| DLG | States, transitions, source triggers/actions | Full trigger/action execution, journal semantics, cross-dialogue behavior | Candlekeep conversations and replies appear |
-| 2DA | Plain-text V1.0 tables, defaults, lookup, catalog loader, CLI inspection | Encrypted legacy tables, additional typed rule consumers, override layering | `STARTARE.2DA` places the selected actor at AR2600's declared start position |
+| CRE | Names, dialogue, animation ID, colors, five script slots, items, and inventory slots | Stats, full equipment behavior, spellbook, effects, death variables, version variants | The prototype player uses a remapped humanoid CRE and remains idle; player inventory is visible with `I`, NPC inventory with `O` |
+| DLG | States, transitions, source triggers/actions, reaction-gated reply selection | Full trigger/action execution, journal semantics, cross-dialogue behavior | Winthrop's visible responses and store route change according to computed player reaction |
+| 2DA | Plain-text V1.0 tables, defaults, lookup, catalog loader, CLI inspection, reaction modifiers | Encrypted legacy tables, additional typed rule consumers, override layering | `STARTARE.2DA` places the actor; `RMODREP.2DA` and `RMODCHR.2DA` select reputation/charisma dialogue branches |
 | IDS | Headered/count-prefixed tables, decimal/hex values, aliases, signatures, reverse lookup | Broader table validation and use throughout the script/effect/rule systems | `TRIGGER.IDS` and `ACTION.IDS` symbolically select the supported live script action |
 | BCS | Compiled envelope, condition/response blocks, trigger/action call indexing | Typed parameters, objects, response weights, full VM, BS catalog loader | `WDASIGHT.BCS` executes its unconditional `RandomWalk()` on Candlekeep watchers |
-| ITM | V1 gameplay header, icons, appearance, price/weight, ability combat subset | Effects, usability, all versions, equipment overlays and full inventory rules | Real CRE/ITM inventory appears with `I`; `E` exercises supported equipment-slot transitions |
+| ITM | V1 gameplay header, icons, appearance, price/weight, ability combat subset | Effects, usability, all versions, equipment overlays and full inventory rules | A persistent player inventory screen appears with `I`; `O`/`E` inspect and exercise NPC equipment transitions |
+| STO | V1 store header, flags, markups, accepted categories, finite/infinite stock, ITM/TLK resolution | Depreciation, reputation/charisma pricing, identification, stealing, drinks, rooms, cures, persistence, other versions | Winthrop's real `StartStore("INN2616")` action is labeled and opens a fixed buy/sell overlay linked to player inventory, mutable gold, and stock |
 
 ## Unaccounted runtime formats: recommended implementation order
 
@@ -66,15 +67,14 @@ complete its named in-game slice, then expanded as later features demand it.
 
 | Order | Format | Why it is interesting | General implementation | Required in-game acceptance test |
 | ---: | --- | --- | --- | --- |
-| 1 | STO | Unlocks Winthrop's shop and the buy/sell loop. | Parse store type/flags, inventory, quantities, prices/markups, identification, drinks, cures, and rumors; connect transactions to party gold and item ownership. | Enter Winthrop's store through dialogue, buy one real item, see gold decrease and the item appear, then sell it back. |
-| 2 | GAM | Supplies party composition, globals, game time, current area, reputation, journal state, and startup/save state. | Add `ResourceKind::Gam`; parse versioned headers and offset tables; convert party members and global variables into canonical simulation state. | Start Candlekeep from the game's GAM state and visibly reflect the correct party, time/global state, and current area. |
-| 3 | SPL | Defines innate, wizard, and priest abilities and their effect lists. | Parse spell metadata, levels/schools, icons, casting data, abilities, and embedded effects; reuse the ITM ability/effect model where layouts overlap. | Cast one stock Candlekeep-available spell/ability and see casting, resource consumption, targeting, and its first gameplay effect. |
-| 4 | EFF | Provides reusable and persistent effects used by items, spells, creatures, and saves. | Parse EFF V1/V2 with an opcode registry; normalize embedded and standalone effects; implement timing, stacking, source attribution, resistance, and deterministic expiration incrementally. | Apply a stock effect, see its stat/status presentation change, wait or dispel it, and see the effect end correctly. |
-| 5 | PRO | Controls projectile travel, impact, area effects, and visual/audio references. | Parse projectile headers and extension records; separate deterministic trajectory/impact rules from rendering; resolve BAM/VVC/SPL references. | Fire a ranged weapon or spell projectile and see it travel, hit the selected target, and apply the effect at impact rather than cast time. |
-| 6 | MOS | Supplies UI panels, minimaps, loading art, and other large static presentation assets. | Parse palette MOS V1/MOSC first, then PVRZ-backed MOS V2; output canonical RGBA images through the existing image boundary. | Replace one generated/debug panel with the original game MOS and verify correct layout, transparency, and scaling in game. |
-| 7 | SAV | Packages mutable GAM/ARE/CRE/STO state for continued play. | Parse the SAV archive container with strict path and size limits; load members through an overlay catalog; write atomically only after canonical save schemas stabilize. | Save after changing Candlekeep state, restart, load, and visibly recover position, inventory, globals, conversations, and store state. |
-| 8 | WMP | Enables world-map discovery and travel after leaving an area. | Correctly map KEY type `0x03f7`; parse maps, area nodes, links, travel times, icons, and encounter references; convert to a travel graph. | Leave Candlekeep, open the world map, select a reachable destination, advance time, and arrive in the expected area. |
-| 9 | CHR | Supports exported/imported player characters and character creation handoff. | Parse the CHR wrapper and embedded CRE; preserve portrait, soundset, and export metadata; reuse CRE conversion. | Import a stock/exported character, start a game, and see its identity, stats, inventory, colors, and portrait. |
+| 1 | GAM | Supplies party composition, globals, game time, current area, reputation, journal state, and startup/save state. | Add `ResourceKind::Gam`; parse versioned headers and offset tables; convert party members and global variables into canonical simulation state. | Start Candlekeep from the game's GAM state and visibly reflect the correct party, time/global state, and current area. |
+| 2 | SPL | Defines innate, wizard, and priest abilities and their effect lists. | Parse spell metadata, levels/schools, icons, casting data, abilities, and embedded effects; reuse the ITM ability/effect model where layouts overlap. | Cast one stock Candlekeep-available spell/ability and see casting, resource consumption, targeting, and its first gameplay effect. |
+| 3 | EFF | Provides reusable and persistent effects used by items, spells, creatures, and saves. | Parse EFF V1/V2 with an opcode registry; normalize embedded and standalone effects; implement timing, stacking, source attribution, resistance, and deterministic expiration incrementally. | Apply a stock effect, see its stat/status presentation change, wait or dispel it, and see the effect end correctly. |
+| 4 | PRO | Controls projectile travel, impact, area effects, and visual/audio references. | Parse projectile headers and extension records; separate deterministic trajectory/impact rules from rendering; resolve BAM/VVC/SPL references. | Fire a ranged weapon or spell projectile and see it travel, hit the selected target, and apply the effect at impact rather than cast time. |
+| 5 | MOS | Supplies UI panels, minimaps, loading art, and other large static presentation assets. | Parse palette MOS V1/MOSC first, then PVRZ-backed MOS V2; output canonical RGBA images through the existing image boundary. | Replace one generated/debug panel with the original game MOS and verify correct layout, transparency, and scaling in game. |
+| 6 | SAV | Packages mutable GAM/ARE/CRE/STO state for continued play. | Parse the SAV archive container with strict path and size limits; load members through an overlay catalog; write atomically only after canonical save schemas stabilize. | Save after changing Candlekeep state, restart, load, and visibly recover position, inventory, globals, conversations, and store state. |
+| 7 | WMP | Enables world-map discovery and travel after leaving an area. | Correctly map KEY type `0x03f7`; parse maps, area nodes, links, travel times, icons, and encounter references; convert to a travel graph. | Leave Candlekeep, open the world map, select a reachable destination, advance time, and arrive in the expected area. |
+| 8 | CHR | Supports exported/imported player characters and character creation handoff. | Parse the CHR wrapper and embedded CRE; preserve portrait, soundset, and export metadata; reuse CRE conversion. | Import a stock/exported character, start a game, and see its identity, stats, inventory, colors, and portrait. |
 
 The minimum path toward a playable Candlekeep remains:
 
@@ -117,6 +117,7 @@ extension. Track these as feature slices so they do not disappear behind the
 | --- | --- | --- |
 | CRE + ITM | Full usability, effects, equipped armor/weapon/offhand/helmet overlays | Imoen/Gorion displays correct body, clothing, weapon, shield, and equipment changes without diagnostic tinting. |
 | IDS + BCS/BS | Typed objects/parameters, response selection, action queue, broader trigger/action VM | A second stock behavior with stateful conditions executes deterministically and BS scripts load through the catalog. |
+| STO + GAM | Replace prototype gold/inventory with party state; add pricing modifiers, services, and persistence | Buy and sell after loading a real game state, then save/reload with identical gold, inventory, and store stock. |
 | BAM | Equipment overlays and remaining animation families/stances | Walk, idle, attack, hit, die, and equipped overlays stay aligned in all facings. |
 | BAM V2 + PVRZ | EE animation pages | Render one stock BAM V2 animation through the normal sprite path. |
 | ARE + WED | Doors, walls, containers, traps, occlusion, entrances | Open a Candlekeep door, walk behind a wall with correct occlusion, and use a container/transition. |
@@ -168,6 +169,6 @@ Known unsupported variants:
 ```
 
 Keep at most one new-format slice and one completion slice active at a time.
-The next recommended slice is the **Winthrop store loop**: complete the DLG/BCS
-`StartStore` path, parse STO, and reuse the new CRE/ITM inventory model for one
-visible buy/sell transaction.
+The next recommended slice is **GAM-backed startup state**: replace prototype
+gold/inventory and the debug selected actor with the real party, globals, time,
+current area, and economy state used by the new store loop.
